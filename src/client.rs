@@ -1,0 +1,1193 @@
+// Copyright (c) 2026 Elias Bachaalany
+// SPDX-License-Identifier: MIT
+
+//! Copilot client for managing connections and sessions.
+//!
+//! The `Client` is the main entry point for the SDK.
+
+use crate::error::{CopilotError, Result};
+use crate::events::SessionEvent;
+use crate::jsonrpc::{StdioJsonRpcClient, TcpJsonRpcClient};
+use crate::process::{CopilotProcess, ProcessOptions};
+use crate::session::Session;
+use crate::types::{
+    ClientOptions, ConnectionState, LogLevel, PingResponse, ResumeSessionConfig,
+    SDK_PROTOCOL_VERSION, SessionConfig, SessionMetadata,
+};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{Mutex, RwLock};
+
+// =============================================================================
+// Helper Functions
+// =============================================================================
+
+/// Resolve CLI command for the current platform.
+///
+/// On Windows, .cmd/.bat files are npm wrappers that need special handling.
+/// We resolve them to their underlying node.js scripts for proper pipe handling.
+fn resolve_cli_command(cli_path: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    let path = cli_path.to_path_buf();
+    let args_owned = args.to_vec();
+
+    // Check if it's a Node.js script - run directly via node
+    if crate::process::is_node_script(&path) {
+        if let Some(node_path) = crate::process::find_node() {
+            let mut full_args = vec![path.to_string_lossy().to_string()];
+            full_args.extend(args_owned);
+            return (node_path, full_args);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows, .cmd files are npm wrapper scripts that launch node.
+        // Running them through cmd.exe causes pipe inheritance issues.
+        // Instead, we find the underlying node.js script and run it directly.
+        if let Some(ext) = path.extension() {
+            let ext_lower = ext.to_string_lossy().to_lowercase();
+            if ext_lower == "cmd" {
+                // npm .cmd files have a corresponding node_modules structure
+                // e.g., C:\Users\...\npm\copilot.cmd -> C:\Users\...\npm\node_modules\@github\copilot\npm-loader.js
+                if let Some(parent) = path.parent() {
+                    // Extract the package name from the .cmd filename
+                    if let Some(stem) = path.file_stem() {
+                        let stem_str = stem.to_string_lossy();
+
+                        // Try to find the npm-loader.js in node_modules
+                        // Common patterns: copilot -> @github/copilot, or package-name -> package-name
+                        let possible_paths = vec![
+                            parent
+                                .join("node_modules/@github")
+                                .join(&*stem_str)
+                                .join("npm-loader.js"),
+                            parent
+                                .join("node_modules")
+                                .join(&*stem_str)
+                                .join("npm-loader.js"),
+                            parent
+                                .join("node_modules/@github")
+                                .join(&*stem_str)
+                                .join("index.js"),
+                            parent
+                                .join("node_modules")
+                                .join(&*stem_str)
+                                .join("index.js"),
+                        ];
+
+                        for loader_path in possible_paths {
+                            if loader_path.exists() {
+                                if let Some(node_path) = crate::process::find_node() {
+                                    let mut full_args =
+                                        vec![loader_path.to_string_lossy().to_string()];
+                                    full_args.extend(args_owned);
+                                    return (node_path, full_args);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: use cmd /c if we can't find the loader
+                let mut full_args = vec!["/c".to_string(), path.to_string_lossy().to_string()];
+                full_args.extend(args_owned);
+                return (PathBuf::from("cmd"), full_args);
+            }
+
+            // For .bat files, use cmd /c
+            if ext_lower == "bat" {
+                let mut full_args = vec!["/c".to_string(), path.to_string_lossy().to_string()];
+                full_args.extend(args_owned);
+                return (PathBuf::from("cmd"), full_args);
+            }
+        }
+
+        // For non-absolute paths without extension, also use cmd /c for PATH resolution
+        if !path.is_absolute() {
+            let mut full_args = vec!["/c".to_string(), path.to_string_lossy().to_string()];
+            full_args.extend(args_owned);
+            return (PathBuf::from("cmd"), full_args);
+        }
+    }
+
+    (path, args_owned)
+}
+
+fn spawn_cli_stderr_logger(stderr: tokio::process::ChildStderr) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(target: "copilot_sdk::cli_stderr", "{line}");
+        }
+    });
+}
+
+/// Handle a tool.call request from the server.
+async fn handle_tool_call(
+    sessions: &RwLock<HashMap<String, Arc<Session>>>,
+    params: &Value,
+) -> Result<Value> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CopilotError::InvalidConfig("Missing sessionId".into()))?;
+
+    let tool_name = params
+        .get("toolName")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CopilotError::InvalidConfig("Missing toolName".into()))?;
+
+    let arguments = normalize_tool_arguments(params);
+
+    let session = sessions.read().await.get(session_id).cloned();
+
+    let session = match session {
+        Some(s) => s,
+        None => {
+            return Ok(json!({
+                "result": {
+                    "textResultForLlm": "Session not found",
+                    "resultType": "failure",
+                    "error": format!("Unknown session {}", session_id)
+                }
+            }));
+        }
+    };
+
+    // Check if tool is registered
+    if session.get_tool(tool_name).await.is_none() {
+        return Ok(json!({
+            "result": {
+                "textResultForLlm": format!("Tool '{}' is not supported.", tool_name),
+                "resultType": "failure",
+                "error": format!("tool '{}' not supported", tool_name)
+            }
+        }));
+    }
+
+    // Invoke the tool handler
+    match session.invoke_tool(tool_name, &arguments).await {
+        Ok(result) => Ok(json!({ "result": result })),
+        Err(e) => Ok(json!({
+            "result": {
+                "textResultForLlm": "Tool execution failed",
+                "resultType": "failure",
+                "error": e.to_string()
+            }
+        })),
+    }
+}
+
+fn normalize_tool_arguments(params: &Value) -> Value {
+    let raw = params
+        .get("arguments")
+        .or_else(|| params.get("argumentsJson"))
+        .cloned()
+        .unwrap_or(json!({}));
+
+    match raw {
+        Value::String(s) => serde_json::from_str(&s).unwrap_or(json!({})),
+        Value::Null => json!({}),
+        other => other,
+    }
+}
+
+/// Handle a permission.request from the server.
+async fn handle_permission_request(
+    sessions: &RwLock<HashMap<String, Arc<Session>>>,
+    params: &Value,
+) -> Result<Value> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CopilotError::InvalidConfig("Missing sessionId".into()))?;
+
+    // Permission request data may be nested in "permissionRequest" field
+    let perm_data = params.get("permissionRequest").unwrap_or(params);
+
+    let session = sessions.read().await.get(session_id).cloned();
+
+    let session = match session {
+        Some(s) => s,
+        None => {
+            // Default deny on unknown session
+            return Ok(json!({
+                "result": {
+                    "kind": "denied-no-approval-rule-and-could-not-request-from-user"
+                }
+            }));
+        }
+    };
+
+    // Build permission request
+    use crate::types::PermissionRequest;
+    let kind = perm_data
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let tool_call_id = perm_data
+        .get("toolCallId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Collect extension data
+    let mut extension_data = HashMap::new();
+    if let Some(obj) = perm_data.as_object() {
+        for (key, value) in obj {
+            if key != "kind" && key != "toolCallId" {
+                extension_data.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    let request = PermissionRequest {
+        kind,
+        tool_call_id,
+        extension_data,
+    };
+
+    let result = session.handle_permission_request(&request).await;
+
+    // Build response
+    let mut response = json!({
+        "result": {
+            "kind": result.kind
+        }
+    });
+
+    if let Some(rules) = result.rules {
+        response["result"]["rules"] = Value::Array(rules);
+    }
+
+    Ok(response)
+}
+
+fn parse_cli_url(url: &str) -> Result<(String, u16)> {
+    let mut s = url.trim();
+    if let Some((_, rest)) = s.split_once("://") {
+        s = rest;
+    }
+    if let Some((host_port, _)) = s.split_once('/') {
+        s = host_port;
+    }
+
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        let port: u16 = s.parse().map_err(|_| {
+            CopilotError::InvalidConfig(format!("Invalid port in cli_url: {}", url))
+        })?;
+        return Ok(("localhost".to_string(), port));
+    }
+
+    if let Some((host, port_str)) = s.rsplit_once(':') {
+        let host = host.trim();
+        let port: u16 = port_str.trim().parse().map_err(|_| {
+            CopilotError::InvalidConfig(format!("Invalid port in cli_url: {}", url))
+        })?;
+        if host.is_empty() {
+            return Ok(("localhost".to_string(), port));
+        }
+        return Ok((host.to_string(), port));
+    }
+
+    Err(CopilotError::InvalidConfig(format!(
+        "Invalid cli_url format (expected host:port or port): {}",
+        url
+    )))
+}
+
+fn parse_listening_port(line: &str) -> Option<u16> {
+    let lower = line.to_lowercase();
+    let idx = lower.find("listening on port")?;
+    let after = &line[idx..];
+
+    let mut digits = String::new();
+    let mut in_digits = false;
+    for ch in after.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            in_digits = true;
+        } else if in_digits {
+            break;
+        }
+    }
+    digits.parse::<u16>().ok()
+}
+
+async fn detect_tcp_port_from_stdout(stdout: tokio::process::ChildStdout) -> Result<u16> {
+    let mut lines = BufReader::new(stdout).lines();
+    let port = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(port) = parse_listening_port(&line) {
+                return Ok(port);
+            }
+        }
+        Err(CopilotError::PortDetectionFailed)
+    })
+    .await
+    .map_err(|_| CopilotError::Timeout(Duration::from_secs(15)))??;
+
+    Ok(port)
+}
+
+enum RpcClient {
+    Stdio(StdioJsonRpcClient),
+    Tcp(TcpJsonRpcClient),
+}
+
+impl RpcClient {
+    async fn stop(&self) {
+        match self {
+            RpcClient::Stdio(rpc) => rpc.stop().await,
+            RpcClient::Tcp(rpc) => rpc.stop().await,
+        }
+    }
+
+    async fn set_notification_handler<F>(&self, handler: F)
+    where
+        F: Fn(&str, &Value) + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        match self {
+            RpcClient::Stdio(rpc) => {
+                let handler = Arc::clone(&handler);
+                rpc.set_notification_handler(move |method, params| {
+                    (handler)(method, params);
+                })
+                .await;
+            }
+            RpcClient::Tcp(rpc) => {
+                let handler = Arc::clone(&handler);
+                rpc.set_notification_handler(move |method, params| {
+                    (handler)(method, params);
+                })
+                .await;
+            }
+        }
+    }
+
+    async fn set_request_handler<F>(&self, handler: F)
+    where
+        F: Fn(&str, &Value) -> crate::jsonrpc::RequestHandlerFuture + Send + Sync + 'static,
+    {
+        let handler = Arc::new(handler);
+        match self {
+            RpcClient::Stdio(rpc) => {
+                let handler = Arc::clone(&handler);
+                rpc.set_request_handler(move |method, params| (handler)(method, params))
+                    .await;
+            }
+            RpcClient::Tcp(rpc) => {
+                let handler = Arc::clone(&handler);
+                rpc.set_request_handler(move |method, params| (handler)(method, params))
+                    .await;
+            }
+        }
+    }
+
+    async fn invoke(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        match self {
+            RpcClient::Stdio(rpc) => rpc.invoke(method, params).await,
+            RpcClient::Tcp(rpc) => rpc.invoke(method, params).await,
+        }
+    }
+}
+
+// =============================================================================
+// Client
+// =============================================================================
+
+/// Copilot client for managing connections and sessions.
+///
+/// The client manages the connection to the Copilot CLI server and provides
+/// methods to create and manage conversation sessions.
+///
+/// # Example
+///
+/// ```no_run
+/// use copilot_sdk::{Client, ClientOptions, SessionConfig};
+///
+/// #[tokio::main]
+/// async fn main() -> copilot_sdk::Result<()> {
+///     // Create client with options
+///     let client = Client::new(ClientOptions::default())?;
+///
+///     // Start the client
+///     client.start().await?;
+///
+///     // Create a session
+///     let session = client.create_session(SessionConfig::default()).await?;
+///
+///     // Send a message
+///     let response = session.send_and_wait("Hello!").await?;
+///     println!("{}", response);
+///
+///     // Stop the client
+///     client.stop().await?;
+///     Ok(())
+/// }
+/// ```
+pub struct Client {
+    options: ClientOptions,
+    state: Arc<RwLock<ConnectionState>>,
+    lifecycle: Mutex<()>,
+    process: Mutex<Option<CopilotProcess>>,
+    rpc: Arc<Mutex<Option<RpcClient>>>,
+    sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
+}
+
+impl Client {
+    /// Create a new Copilot client with the given options.
+    pub fn new(options: ClientOptions) -> Result<Self> {
+        let mut options = options;
+
+        if options.cli_url.is_some() {
+            options.use_stdio = false;
+        }
+
+        // Validate mutually exclusive options
+        if options.cli_url.is_some() {
+            if options.cli_path.is_some() {
+                return Err(CopilotError::InvalidConfig(
+                    "cli_url is mutually exclusive with cli_path".into(),
+                ));
+            }
+            if options.port != 0 {
+                return Err(CopilotError::InvalidConfig(
+                    "cli_url is mutually exclusive with port".into(),
+                ));
+            }
+        }
+        if options.use_stdio && options.port != 0 {
+            return Err(CopilotError::InvalidConfig(
+                "port is only valid when use_stdio=false".into(),
+            ));
+        }
+
+        Ok(Self {
+            options,
+            state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+            lifecycle: Mutex::new(()),
+            process: Mutex::new(None),
+            rpc: Arc::new(Mutex::new(None)),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    /// Create a client builder for fluent configuration.
+    pub fn builder() -> ClientBuilder {
+        ClientBuilder::new()
+    }
+
+    // =========================================================================
+    // Connection Management
+    // =========================================================================
+
+    /// Start the client and connect to the server.
+    pub async fn start(&self) -> Result<()> {
+        let _guard = self.lifecycle.lock().await;
+
+        let mut state = self.state.write().await;
+        if *state == ConnectionState::Connected {
+            return Ok(());
+        }
+        if *state != ConnectionState::Disconnected {
+            return Err(CopilotError::InvalidConfig(
+                "Client is already started".into(),
+            ));
+        }
+        *state = ConnectionState::Connecting;
+        drop(state);
+
+        // Start CLI server process
+        let result = self.start_cli_server().await;
+        if let Err(e) = result {
+            *self.state.write().await = ConnectionState::Error;
+            return Err(e);
+        }
+
+        // Verify protocol version
+        if let Err(e) = self.verify_protocol_version().await {
+            *self.state.write().await = ConnectionState::Error;
+            return Err(e);
+        }
+
+        // Set up event handlers
+        self.setup_handlers().await?;
+
+        *self.state.write().await = ConnectionState::Connected;
+        Ok(())
+    }
+
+    /// Stop the client gracefully.
+    pub async fn stop(&self) -> Result<()> {
+        let _guard = self.lifecycle.lock().await;
+
+        let state = *self.state.read().await;
+        if state == ConnectionState::Disconnected {
+            self.sessions.write().await.clear();
+            *self.rpc.lock().await = None;
+            *self.process.lock().await = None;
+            return Ok(());
+        }
+
+        // Best-effort destroy of all active sessions while still connected.
+        let sessions: Vec<Arc<Session>> = self.sessions.read().await.values().cloned().collect();
+        for session in sessions {
+            let _ = session.destroy().await;
+        }
+        self.sessions.write().await.clear();
+
+        // Stop the RPC client
+        if let Some(rpc) = self.rpc.lock().await.take() {
+            rpc.stop().await;
+        }
+
+        // Stop the process
+        if let Some(mut process) = self.process.lock().await.take() {
+            let _ = process.terminate();
+            let _ = process.wait().await;
+        }
+
+        *self.state.write().await = ConnectionState::Disconnected;
+        Ok(())
+    }
+
+    /// Force stop the client immediately.
+    pub async fn force_stop(&self) {
+        let _guard = self.lifecycle.lock().await;
+
+        self.sessions.write().await.clear();
+
+        // Kill the process
+        if let Some(mut process) = self.process.lock().await.take() {
+            let _ = process.kill();
+        }
+
+        // Stop the RPC client
+        if let Some(rpc) = self.rpc.lock().await.take() {
+            rpc.stop().await;
+        }
+
+        *self.state.write().await = ConnectionState::Disconnected;
+    }
+
+    /// Get the current connection state.
+    pub async fn state(&self) -> ConnectionState {
+        *self.state.read().await
+    }
+
+    // =========================================================================
+    // Session Management
+    // =========================================================================
+
+    /// Create a new Copilot session.
+    pub async fn create_session(&self, config: SessionConfig) -> Result<Arc<Session>> {
+        self.ensure_connected().await?;
+
+        // Build the request
+        let params = serde_json::to_value(&config)?;
+
+        // Send the request
+        let result = self.invoke("session.create", Some(params)).await?;
+
+        // Extract session ID
+        let session_id = result
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CopilotError::Protocol("Missing sessionId in response".into()))?
+            .to_string();
+
+        // Create session object
+        let session = self.create_session_object(session_id.clone()).await;
+
+        // Store session
+        self.sessions
+            .write()
+            .await
+            .insert(session_id, Arc::clone(&session));
+
+        Ok(session)
+    }
+
+    /// Resume an existing session.
+    pub async fn resume_session(
+        &self,
+        session_id: &str,
+        config: ResumeSessionConfig,
+    ) -> Result<Arc<Session>> {
+        self.ensure_connected().await?;
+
+        // Build the request
+        let params = json!({
+            "sessionId": session_id,
+            "tools": config.tools,
+            "provider": config.provider,
+            "mcpServers": config.mcp_servers,
+            "customAgents": config.custom_agents,
+        });
+
+        // Send the request
+        let result = self.invoke("session.resume", Some(params)).await?;
+
+        // Extract session ID from response
+        let resumed_id = result
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or(session_id)
+            .to_string();
+
+        // Create session object
+        let session = self.create_session_object(resumed_id.clone()).await;
+
+        // Store session
+        self.sessions
+            .write()
+            .await
+            .insert(resumed_id, Arc::clone(&session));
+
+        Ok(session)
+    }
+
+    /// List all available sessions.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
+        self.ensure_connected().await?;
+
+        let result = self.invoke("session.list", None).await?;
+
+        let sessions: Vec<SessionMetadata> = result
+            .get("sessions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        Ok(sessions)
+    }
+
+    /// Delete a session.
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.ensure_connected().await?;
+
+        let params = json!({ "sessionId": session_id });
+        self.invoke("session.delete", Some(params)).await?;
+
+        // Remove from local cache
+        self.sessions.write().await.remove(session_id);
+
+        Ok(())
+    }
+
+    /// Get the ID of the most recently used session.
+    pub async fn get_last_session_id(&self) -> Result<Option<String>> {
+        self.ensure_connected().await?;
+
+        let result = self.invoke("session.getLastId", None).await?;
+
+        Ok(result
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
+    }
+
+    // =========================================================================
+    // Server Communication
+    // =========================================================================
+
+    /// Send a ping to verify connection health.
+    pub async fn ping(&self, message: Option<String>) -> Result<PingResponse> {
+        self.ensure_connected().await?;
+
+        let params = message.map(|m| json!({ "message": m }));
+        let result = self.invoke("ping", params).await?;
+
+        Ok(PingResponse {
+            message: result
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            timestamp: result
+                .get("timestamp")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            protocol_version: result
+                .get("protocolVersion")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
+        })
+    }
+
+    // =========================================================================
+    // Internal Methods
+    // =========================================================================
+
+    /// Invoke a JSON-RPC method.
+    pub(crate) async fn invoke(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        let mut attempt = 0;
+
+        loop {
+            let result = {
+                let rpc = self.rpc.lock().await;
+                let rpc = rpc.as_ref().ok_or(CopilotError::NotConnected)?;
+                rpc.invoke(method, params.clone()).await
+            };
+
+            match result {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if attempt == 0
+                        && *self.state.read().await == ConnectionState::Connected
+                        && self.options.auto_restart
+                        && self.should_restart_on_error(&e)
+                    {
+                        attempt += 1;
+                        self.restart().await?;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Get a session by ID.
+    pub async fn get_session(&self, session_id: &str) -> Option<Arc<Session>> {
+        self.sessions.read().await.get(session_id).cloned()
+    }
+
+    /// Ensure client is connected.
+    async fn ensure_connected(&self) -> Result<()> {
+        match *self.state.read().await {
+            ConnectionState::Connected => Ok(()),
+            ConnectionState::Disconnected => {
+                if self.options.auto_start {
+                    self.start().await
+                } else {
+                    Err(CopilotError::NotConnected)
+                }
+            }
+            ConnectionState::Error => {
+                if self.options.auto_restart {
+                    self.restart().await
+                } else {
+                    Err(CopilotError::NotConnected)
+                }
+            }
+            ConnectionState::Connecting => Err(CopilotError::NotConnected),
+        }
+    }
+
+    fn should_restart_on_error(&self, err: &CopilotError) -> bool {
+        match err {
+            CopilotError::ConnectionClosed | CopilotError::NotConnected => true,
+            CopilotError::Transport(_) => true,
+            CopilotError::ProcessExit(_) => true,
+            CopilotError::JsonRpc { code, .. } => *code == -32801,
+            _ => false,
+        }
+    }
+
+    async fn restart(&self) -> Result<()> {
+        self.force_stop().await;
+        self.start().await
+    }
+
+    /// Start the CLI server process.
+    async fn start_cli_server(&self) -> Result<()> {
+        if let Some(cli_url) = &self.options.cli_url {
+            let (host, port) = parse_cli_url(cli_url)?;
+            let addr = format!("{}:{}", host, port);
+
+            let rpc = TcpJsonRpcClient::connect(addr).await?;
+            rpc.start().await?;
+
+            *self.rpc.lock().await = Some(RpcClient::Tcp(rpc));
+            return Ok(());
+        }
+
+        let cli_path = self
+            .options
+            .cli_path
+            .clone()
+            .or_else(crate::process::find_copilot_cli)
+            .ok_or_else(|| {
+                CopilotError::InvalidConfig("Could not find Copilot CLI executable".into())
+            })?;
+
+        let log_level = self.options.log_level.to_string();
+
+        let mut args: Vec<String> = Vec::new();
+        if let Some(extra_args) = &self.options.cli_args {
+            args.extend(extra_args.iter().cloned());
+        }
+        args.extend(["--server".to_string(), "--log-level".to_string(), log_level]);
+
+        if self.options.use_stdio {
+            args.push("--stdio".to_string());
+        } else if self.options.port != 0 {
+            args.extend(["--port".to_string(), self.options.port.to_string()]);
+        }
+
+        // Resolve command and arguments based on platform
+        // On Windows, use cmd /c for PATH resolution if path is not absolute (for .cmd files)
+        let (executable, full_args) = resolve_cli_command(&cli_path, &args);
+
+        // Build process options
+        let mut proc_options = ProcessOptions::new()
+            .stdin(self.options.use_stdio)
+            .stdout(true)
+            .stderr(true);
+
+        if let Some(ref dir) = self.options.cwd {
+            proc_options = proc_options.working_dir(dir.clone());
+        }
+
+        // Add environment variables
+        if let Some(ref env) = self.options.environment {
+            for (key, value) in env {
+                proc_options = proc_options.env(key, value);
+            }
+        }
+
+        // Remove NODE_DEBUG to avoid debug output interfering with JSON-RPC
+        proc_options = proc_options.env("NODE_DEBUG", "");
+
+        let args_refs: Vec<&str> = full_args.iter().map(|s| s.as_str()).collect();
+        let mut process = CopilotProcess::spawn(&executable, &args_refs, proc_options)?;
+
+        if let Some(stderr) = process.take_stderr() {
+            spawn_cli_stderr_logger(stderr);
+        }
+
+        let rpc = if self.options.use_stdio {
+            let transport = process.take_transport().ok_or_else(|| {
+                CopilotError::InvalidConfig("Failed to get transport from process".into())
+            })?;
+            let rpc = StdioJsonRpcClient::new(transport);
+            rpc.start().await?;
+            RpcClient::Stdio(rpc)
+        } else {
+            let stdout = process.take_stdout().ok_or_else(|| {
+                CopilotError::InvalidConfig("Failed to capture stdout for port detection".into())
+            })?;
+
+            let detected_port = detect_tcp_port_from_stdout(stdout).await?;
+            let addr = format!("127.0.0.1:{}", detected_port);
+            let rpc = TcpJsonRpcClient::connect(addr).await?;
+            rpc.start().await?;
+            RpcClient::Tcp(rpc)
+        };
+
+        *self.process.lock().await = Some(process);
+        *self.rpc.lock().await = Some(rpc);
+
+        Ok(())
+    }
+
+    /// Verify protocol version matches.
+    async fn verify_protocol_version(&self) -> Result<()> {
+        // NOTE: We call the underlying RPC directly instead of ping() because ping() calls
+        // ensure_connected(), but we haven't set state to Connected yet.
+        let rpc = self.rpc.lock().await;
+        let rpc = rpc.as_ref().ok_or(CopilotError::NotConnected)?;
+        let result = rpc
+            .invoke("ping", Some(serde_json::json!({ "message": null })))
+            .await?;
+
+        let protocol_version = result
+            .get("protocolVersion")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
+        if let Some(version) = protocol_version {
+            if version != SDK_PROTOCOL_VERSION {
+                return Err(CopilotError::ProtocolMismatch {
+                    expected: SDK_PROTOCOL_VERSION,
+                    actual: version,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Set up notification and request handlers.
+    async fn setup_handlers(&self) -> Result<()> {
+        let rpc = self.rpc.lock().await;
+        let rpc = rpc.as_ref().ok_or(CopilotError::NotConnected)?;
+
+        // Clone Arc references for the handlers
+        let sessions = Arc::clone(&self.sessions);
+
+        // Set up notification handler for session events
+        rpc.set_notification_handler(move |method, params| {
+            if method == "session.event" {
+                let sessions = Arc::clone(&sessions);
+                let params = params.clone();
+
+                // Spawn a task to handle the event
+                tokio::spawn(async move {
+                    if let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) {
+                        if let Some(session) = sessions.read().await.get(session_id) {
+                            if let Some(event_data) = params.get("event") {
+                                if let Ok(event) = SessionEvent::from_json(event_data) {
+                                    session.dispatch_event(event).await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        })
+        .await;
+
+        // Clone Arc references for request handler
+        let sessions_for_requests = Arc::clone(&self.sessions);
+
+        // Set up request handler for tool.call and permission.request
+        rpc.set_request_handler(move |method, params| {
+            use crate::jsonrpc::JsonRpcError;
+
+            let sessions = Arc::clone(&sessions_for_requests);
+            let method = method.to_string();
+            let params = params.clone();
+
+            Box::pin(async move {
+                let result = match method.as_str() {
+                    "tool.call" => handle_tool_call(&sessions, &params).await,
+                    "permission.request" => handle_permission_request(&sessions, &params).await,
+                    _ => {
+                        return Err(JsonRpcError::new(
+                            -32601,
+                            format!("Unknown method: {}", method),
+                        ));
+                    }
+                };
+
+                result.map_err(|e| JsonRpcError::new(-32000, e.to_string()))
+            })
+        })
+        .await;
+
+        Ok(())
+    }
+
+    /// Create a session object with the invoke function.
+    async fn create_session_object(&self, session_id: String) -> Arc<Session> {
+        let rpc = Arc::clone(&self.rpc);
+
+        // Create the invoke function that captures the RPC client
+        let invoke_fn = move |method: &str, params: Option<Value>| {
+            let rpc = Arc::clone(&rpc);
+            let method = method.to_string();
+
+            Box::pin(async move {
+                let rpc = rpc.lock().await;
+                let rpc = rpc.as_ref().ok_or(CopilotError::NotConnected)?;
+                rpc.invoke(&method, params).await
+            }) as crate::session::InvokeFuture
+        };
+
+        Arc::new(Session::new(session_id, invoke_fn))
+    }
+}
+
+// =============================================================================
+// Client Builder
+// =============================================================================
+
+/// Builder for creating a Copilot client.
+#[derive(Debug, Default)]
+pub struct ClientBuilder {
+    options: ClientOptions,
+}
+
+impl ClientBuilder {
+    /// Create a new builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the CLI executable path.
+    pub fn cli_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.options.cli_path = Some(path.into());
+        self
+    }
+
+    /// Set additional CLI arguments passed to the Copilot CLI.
+    pub fn cli_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.options.cli_args = Some(args.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Add a single CLI argument passed to the Copilot CLI.
+    pub fn cli_arg(mut self, arg: impl Into<String>) -> Self {
+        self.options
+            .cli_args
+            .get_or_insert_with(Vec::new)
+            .push(arg.into());
+        self
+    }
+
+    /// Use stdio mode (default).
+    pub fn use_stdio(mut self, use_stdio: bool) -> Self {
+        self.options.use_stdio = use_stdio;
+        self
+    }
+
+    /// Set the CLI URL for TCP mode.
+    ///
+    /// Supports: `"host:port"`, `"http://host:port"`, or `"port"` (defaults to localhost).
+    pub fn cli_url(mut self, url: impl Into<String>) -> Self {
+        self.options.cli_url = Some(url.into());
+        self.options.use_stdio = false;
+        self
+    }
+
+    /// Set port for TCP mode (ignored for stdio mode).
+    ///
+    /// Use `0` to let the CLI choose a random available port.
+    pub fn port(mut self, port: u16) -> Self {
+        self.options.port = port;
+        self
+    }
+
+    /// Auto-start the connection on first use.
+    pub fn auto_start(mut self, auto_start: bool) -> Self {
+        self.options.auto_start = auto_start;
+        self
+    }
+
+    /// Auto-restart the connection after a fatal failure.
+    pub fn auto_restart(mut self, auto_restart: bool) -> Self {
+        self.options.auto_restart = auto_restart;
+        self
+    }
+
+    /// Set the log level.
+    pub fn log_level(mut self, level: LogLevel) -> Self {
+        self.options.log_level = level;
+        self
+    }
+
+    /// Set the working directory.
+    pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.options.cwd = Some(dir.into());
+        self
+    }
+
+    /// Add an environment variable.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.options
+            .environment
+            .get_or_insert_with(HashMap::new)
+            .insert(key.into(), value.into());
+        self
+    }
+
+    /// Build the client.
+    pub fn build(self) -> Result<Client> {
+        Client::new(self.options)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_builder() {
+        let client = Client::builder()
+            .cli_path("/usr/bin/copilot")
+            .cli_arg("--foo")
+            .use_stdio(true)
+            .log_level(LogLevel::Debug)
+            .cwd("/tmp")
+            .env("FOO", "bar")
+            .build();
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_client_mutually_exclusive_options() {
+        let options = ClientOptions {
+            cli_path: Some("/usr/bin/copilot".into()),
+            cli_url: Some("http://localhost:8080".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Client::new(options),
+            Err(CopilotError::InvalidConfig(_))
+        ));
+
+        let options = ClientOptions {
+            cli_url: Some("localhost:8080".into()),
+            port: 1234,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Client::new(options),
+            Err(CopilotError::InvalidConfig(_))
+        ));
+
+        let options = ClientOptions {
+            use_stdio: true,
+            port: 1234,
+            ..Default::default()
+        };
+        assert!(matches!(
+            Client::new(options),
+            Err(CopilotError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_client_state_initial() {
+        let client = Client::new(ClientOptions::default()).unwrap();
+        assert_eq!(client.state().await, ConnectionState::Disconnected);
+    }
+
+    #[test]
+    fn test_normalize_tool_arguments_object() {
+        let params = json!({
+            "arguments": { "n": 42 }
+        });
+        assert_eq!(normalize_tool_arguments(&params), json!({ "n": 42 }));
+    }
+
+    #[test]
+    fn test_normalize_tool_arguments_string() {
+        let params = json!({
+            "arguments": "{\"n\":42}"
+        });
+        assert_eq!(normalize_tool_arguments(&params), json!({ "n": 42 }));
+    }
+
+    #[test]
+    fn test_normalize_tool_arguments_fallback_arguments_json() {
+        let params = json!({
+            "argumentsJson": "{\"text\":\"hello\",\"shift\":-5}"
+        });
+        assert_eq!(
+            normalize_tool_arguments(&params),
+            json!({ "text": "hello", "shift": -5 })
+        );
+    }
+
+    #[test]
+    fn test_normalize_tool_arguments_invalid_json_string() {
+        let params = json!({
+            "arguments": "{not valid json"
+        });
+        assert_eq!(normalize_tool_arguments(&params), json!({}));
+    }
+}
