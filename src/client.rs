@@ -1232,24 +1232,31 @@ impl Client {
         let sessions = Arc::clone(&self.sessions);
         let lifecycle_handlers = Arc::clone(&self.lifecycle_handlers);
 
-        // Set up notification handler for session events and lifecycle events
-        rpc.set_notification_handler(move |method, params| {
-            if method == "session.event" {
-                let sessions = Arc::clone(&sessions);
-                let params = params.clone();
-
-                // Spawn a task to handle the event
-                tokio::spawn(async move {
-                    if let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) {
-                        if let Some(session) = sessions.read().await.get(session_id) {
-                            if let Some(event_data) = params.get("event") {
-                                if let Ok(event) = SessionEvent::from_json(event_data) {
-                                    session.dispatch_event(event).await;
-                                }
-                            }
+        // Set up notification handler for session events and lifecycle events.
+        // Use an unbounded channel to serialize event processing — the CLI
+        // sends events in causal order (parent before child) and we must
+        // preserve that order. Spawning a task per notification would race.
+        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<(String, serde_json::Value)>();
+        {
+            let sessions = Arc::clone(&sessions);
+            tokio::spawn(async move {
+                while let Some((session_id, event_data)) = evt_rx.recv().await {
+                    if let Some(session) = sessions.read().await.get(&session_id) {
+                        if let Ok(event) = SessionEvent::from_json(&event_data) {
+                            session.dispatch_event(event).await;
                         }
                     }
-                });
+                }
+            });
+        }
+
+        rpc.set_notification_handler(move |method, params| {
+            if method == "session.event" {
+                if let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) {
+                    if let Some(event_data) = params.get("event") {
+                        let _ = evt_tx.send((session_id.to_string(), event_data.clone()));
+                    }
+                }
             } else if method == "session.lifecycle" {
                 let lifecycle_handlers = Arc::clone(&lifecycle_handlers);
                 let params = params.clone();
