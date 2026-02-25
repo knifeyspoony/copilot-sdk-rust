@@ -552,6 +552,72 @@ pub struct SkillInvokedData {
     pub allowed_tools: Option<Vec<String>>,
 }
 
+/// Data for session.context_changed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContextChangedData {
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Data for session.mode_changed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeChangedData {
+    pub previous_mode: String,
+    pub new_mode: String,
+}
+
+/// Data for session.plan_changed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPlanChangedData {
+    pub operation: String,
+}
+
+/// Data for session.task_complete event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTaskCompleteData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+/// Data for session.title_changed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTitleChangedData {
+    pub title: String,
+}
+
+/// Data for session.warning event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWarningData {
+    pub warning_type: String,
+    pub message: String,
+}
+
+/// Data for session.workspace_file_changed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionWorkspaceFileChangedData {
+    pub path: String,
+    pub operation: String,
+}
+
+/// Data for assistant.streaming_delta event (ephemeral progress indicator).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantStreamingDeltaData {
+    pub total_response_size_bytes: f64,
+}
+
 // =============================================================================
 // Session Event (Discriminated Union)
 // =============================================================================
@@ -597,6 +663,14 @@ pub enum SessionEventData {
     SessionSnapshotRewind(SessionSnapshotRewindData),
     SessionUsageInfo(SessionUsageInfoData),
     SkillInvoked(SkillInvokedData),
+    SessionContextChanged(SessionContextChangedData),
+    SessionModeChanged(SessionModeChangedData),
+    SessionPlanChanged(SessionPlanChangedData),
+    SessionTaskComplete(SessionTaskCompleteData),
+    SessionTitleChanged(SessionTitleChangedData),
+    SessionWarning(SessionWarningData),
+    SessionWorkspaceFileChanged(SessionWorkspaceFileChangedData),
+    AssistantStreamingDelta(AssistantStreamingDeltaData),
     /// Unknown event - preserves raw JSON for forward compatibility.
     Unknown(serde_json::Value),
 }
@@ -783,6 +857,9 @@ fn parse_event_data(event_type: &str, data: serde_json::Value) -> SessionEventDa
         "assistant.message_delta" => serde_json::from_value(data)
             .map(SessionEventData::AssistantMessageDelta)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "assistant.streaming_delta" => serde_json::from_value(data)
+            .map(SessionEventData::AssistantStreamingDelta)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         "assistant.turn_end" => serde_json::from_value(data)
             .map(SessionEventData::AssistantTurnEnd)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
@@ -846,6 +923,27 @@ fn parse_event_data(event_type: &str, data: serde_json::Value) -> SessionEventDa
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         "skill.invoked" => serde_json::from_value(data)
             .map(SessionEventData::SkillInvoked)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "session.context_changed" => serde_json::from_value(data)
+            .map(SessionEventData::SessionContextChanged)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "session.mode_changed" => serde_json::from_value(data)
+            .map(SessionEventData::SessionModeChanged)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "session.plan_changed" => serde_json::from_value(data)
+            .map(SessionEventData::SessionPlanChanged)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "session.task_complete" => serde_json::from_value(data)
+            .map(SessionEventData::SessionTaskComplete)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "session.title_changed" => serde_json::from_value(data)
+            .map(SessionEventData::SessionTitleChanged)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "session.warning" => serde_json::from_value(data)
+            .map(SessionEventData::SessionWarning)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "session.workspace_file_changed" => serde_json::from_value(data)
+            .map(SessionEventData::SessionWorkspaceFileChanged)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         // Unknown event type - preserve raw data
         _ => SessionEventData::Unknown(data),
