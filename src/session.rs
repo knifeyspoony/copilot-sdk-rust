@@ -7,6 +7,7 @@
 
 use crate::error::{CopilotError, Result};
 use crate::events::{SessionEvent, SessionEventData};
+use crate::sdk_dlog;
 use crate::types::{
     ErrorOccurredHookInput, MessageOptions, PermissionRequest, PermissionRequestResult,
     PostToolUseHookInput, PreToolUseHookInput, SessionEndHookInput, SessionHooks,
@@ -277,31 +278,63 @@ impl Session {
             "sessionId": self.session_id,
         });
 
+        sdk_dlog!("get_messages: session={}", self.session_id);
         let result = (self.invoke_fn)("session.getMessages", Some(params)).await?;
+
+        let parse_events = |arr: &[serde_json::Value]| -> Vec<SessionEvent> {
+            let mut events = Vec::with_capacity(arr.len());
+            for (i, v) in arr.iter().enumerate() {
+                match SessionEvent::from_json(v) {
+                    Ok(ev) => {
+                        let ptcid = v.get("data")
+                            .and_then(|d| d.get("parentToolCallId"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("-");
+                        sdk_dlog!(
+                            "get_messages: #{i} type={} id={} pid={} ptcid={}",
+                            ev.event_type,
+                            &ev.id,
+                            ev.parent_id.as_deref().unwrap_or("-"),
+                            ptcid,
+                        );
+                        events.push(ev);
+                    }
+                    Err(err) => {
+                        let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                        sdk_dlog!(
+                            "get_messages: PARSE ERROR event #{i} (type={etype}): {err}"
+                        );
+                    }
+                }
+            }
+            events
+        };
 
         let events: Vec<SessionEvent> = result
             .get("events")
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| SessionEvent::from_json(v).ok())
-                    .collect()
-            })
+            .map(|arr| parse_events(arr))
             .or_else(|| {
                 result
                     .get("messages")
                     .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| SessionEvent::from_json(v).ok())
-                            .collect()
-                    })
+                    .map(|arr| parse_events(arr))
             })
             .ok_or_else(|| {
                 CopilotError::Protocol("Missing events in getMessages response".into())
             })?;
 
+        sdk_dlog!("get_messages: {} events parsed", events.len());
         Ok(events)
+    }
+
+    /// Return the raw JSON response from `session.getMessages` without parsing.
+    pub async fn get_messages_raw(&self) -> Result<serde_json::Value> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+        });
+        let result = (self.invoke_fn)("session.getMessages", Some(params)).await?;
+        Ok(result)
     }
 
     // =========================================================================
