@@ -8,6 +8,7 @@
 use crate::error::{CopilotError, Result};
 use crate::events::SessionEvent;
 use crate::jsonrpc::{StdioJsonRpcClient, TcpJsonRpcClient};
+use crate::sdk_dlog;
 use crate::process::{CopilotProcess, ProcessOptions};
 use crate::session::Session;
 use crate::types::{
@@ -1242,8 +1243,21 @@ impl Client {
             tokio::spawn(async move {
                 while let Some((session_id, event_data)) = evt_rx.recv().await {
                     if let Some(session) = sessions.read().await.get(&session_id) {
-                        if let Ok(event) = SessionEvent::from_json(&event_data) {
-                            session.dispatch_event(event).await;
+                        match SessionEvent::from_json(&event_data) {
+                            Ok(event) => {
+                                sdk_dlog!(
+                                    "dispatch: sid={} type={} id={} pid={}",
+                                    &session_id[session_id.len().saturating_sub(8)..],
+                                    event.event_type,
+                                    &event.id,
+                                    event.parent_id.as_deref().unwrap_or("-"),
+                                );
+                                session.dispatch_event(event).await;
+                            }
+                            Err(err) => {
+                                let etype = event_data.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                                sdk_dlog!("dispatch: PARSE ERROR type={etype}: {err}");
+                            }
                         }
                     }
                 }
@@ -1254,10 +1268,13 @@ impl Client {
             if method == "session.event" {
                 if let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) {
                     if let Some(event_data) = params.get("event") {
+                        let etype = event_data.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                        sdk_dlog!("notification: session.event type={etype}");
                         let _ = evt_tx.send((session_id.to_string(), event_data.clone()));
                     }
                 }
             } else if method == "session.lifecycle" {
+                sdk_dlog!("notification: session.lifecycle");
                 let lifecycle_handlers = Arc::clone(&lifecycle_handlers);
                 let params = params.clone();
 
