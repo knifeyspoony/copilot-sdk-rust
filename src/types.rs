@@ -192,6 +192,10 @@ pub struct PermissionRequestResult {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<serde_json::Value>>,
+    /// Optional user feedback when the permission is denied interactively.
+    /// Sent back to the model as part of the tool result so it can adapt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
 }
 
 impl PermissionRequestResult {
@@ -200,6 +204,7 @@ impl PermissionRequestResult {
         Self {
             kind: "approved".to_string(),
             rules: None,
+            feedback: None,
         }
     }
 
@@ -208,6 +213,19 @@ impl PermissionRequestResult {
         Self {
             kind: "denied-no-approval-rule-and-could-not-request-from-user".to_string(),
             rules: None,
+            feedback: None,
+        }
+    }
+
+    /// Create a "denied by user" result with optional feedback text.
+    ///
+    /// The feedback is included in the tool result sent to the model so it
+    /// can adjust its approach (e.g. "use a different file" or "skip this step").
+    pub fn denied_by_user(feedback: Option<String>) -> Self {
+        Self {
+            kind: "denied-interactively-by-user".to_string(),
+            rules: None,
+            feedback,
         }
     }
 
@@ -544,7 +562,7 @@ impl Serialize for Tool {
         let mut state = serializer.serialize_struct("Tool", 3)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("description", &self.description)?;
-        state.serialize_field("parametersSchema", &self.parameters_schema)?;
+        state.serialize_field("parameters", &self.parameters_schema)?;
         state.end()
     }
 }
@@ -846,13 +864,18 @@ pub struct SessionConfig {
     #[serde(skip)]
     pub hooks: Option<SessionHooks>,
 
+    /// Hook types advertised to the server so it sends `hooks.invoke` callbacks.
+    /// Automatically populated from `hooks` by `Client::create_session`.
+    /// E.g. `["preToolUse", "postToolUse", "sessionStart"]`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "hooks")]
+    pub supported_hooks: Option<Vec<String>>,
+
     /// If true and provider/model not explicitly set, load from `COPILOT_SDK_BYOK_*` env vars.
     ///
     /// Default: false (explicit configuration preferred over environment variables)
     #[serde(skip)]
     pub auto_byok_from_env: bool,
 }
-
 /// Configuration for resuming an existing session.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -899,6 +922,10 @@ pub struct ResumeSessionConfig {
     /// Session hooks for pre/post tool use, session lifecycle, etc.
     #[serde(skip)]
     pub hooks: Option<SessionHooks>,
+
+    /// Hook types advertised to the server so it sends `hooks.invoke` callbacks.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "hooks")]
+    pub supported_hooks: Option<Vec<String>>,
 
     /// If true and provider not explicitly set, load from `COPILOT_SDK_BYOK_*` env vars.
     ///

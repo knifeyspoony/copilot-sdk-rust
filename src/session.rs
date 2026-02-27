@@ -405,6 +405,7 @@ impl Session {
     where
         F: Fn(&PermissionRequest) -> PermissionRequestResult + Send + Sync + 'static,
     {
+        sdk_dlog!("register_permission_handler: registering handler for session");
         let mut state = self.state.write().await;
         state.permission_handler = Some(Arc::new(handler));
     }
@@ -420,8 +421,12 @@ impl Session {
         let state = self.state.read().await;
 
         if let Some(handler) = &state.permission_handler {
-            handler(request)
+            sdk_dlog!("handle_permission_request: calling registered handler for kind={}", request.kind);
+            let result = handler(request);
+            sdk_dlog!("handle_permission_request: handler returned kind={}", result.kind);
+            result
         } else {
+            sdk_dlog!("handle_permission_request: NO handler registered — default deny");
             // Default: deny all permissions
             PermissionRequestResult::denied()
         }

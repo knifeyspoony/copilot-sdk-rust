@@ -148,7 +148,14 @@ async fn handle_tool_call(
         .and_then(|v| v.as_str())
         .ok_or_else(|| CopilotError::InvalidConfig("Missing toolName".into()))?;
 
-    let arguments = normalize_tool_arguments(params);
+    let mut arguments = normalize_tool_arguments(params);
+
+    // Inject toolCallId so tool handlers can access it as __tool_call_id.
+    if let Some(tool_call_id) = params.get("toolCallId").and_then(|v| v.as_str()) {
+        if let Some(obj) = arguments.as_object_mut() {
+            obj.insert("__tool_call_id".to_string(), json!(tool_call_id));
+        }
+    }
 
     let session = sessions.read().await.get(session_id).cloned();
 
@@ -208,6 +215,8 @@ async fn handle_permission_request(
     sessions: &RwLock<HashMap<String, Arc<Session>>>,
     params: &Value,
 ) -> Result<Value> {
+    sdk_dlog!("handle_permission_request: params={}", serde_json::to_string_pretty(params).unwrap_or_default());
+
     let session_id = params
         .get("sessionId")
         .and_then(|v| v.as_str())
@@ -217,10 +226,13 @@ async fn handle_permission_request(
     let perm_data = params.get("permissionRequest").unwrap_or(params);
 
     let session = sessions.read().await.get(session_id).cloned();
+    let known_ids: Vec<String> = sessions.read().await.keys().cloned().collect();
+    sdk_dlog!("handle_permission_request: looking for session_id={}, known_ids={:?}", session_id, known_ids);
 
     let session = match session {
         Some(s) => s,
         None => {
+            sdk_dlog!("handle_permission_request: SESSION NOT FOUND — returning denied");
             // Default deny on unknown session
             return Ok(json!({
                 "result": {
@@ -260,6 +272,7 @@ async fn handle_permission_request(
     };
 
     let result = session.handle_permission_request(&request).await;
+    sdk_dlog!("handle_permission_request: handler returned kind={}", result.kind);
 
     // Build response
     let mut response = json!({
@@ -270,6 +283,10 @@ async fn handle_permission_request(
 
     if let Some(rules) = result.rules {
         response["result"]["rules"] = Value::Array(rules);
+    }
+
+    if let Some(feedback) = result.feedback {
+        response["result"]["feedback"] = Value::String(feedback);
     }
 
     Ok(response)
@@ -321,6 +338,8 @@ async fn handle_hooks_invoke(
     sessions: &RwLock<HashMap<String, Arc<Session>>>,
     params: &Value,
 ) -> Result<Value> {
+    sdk_dlog!("handle_hooks_invoke: params={}", serde_json::to_string_pretty(params).unwrap_or_default());
+
     let session_id = params
         .get("sessionId")
         .and_then(|v| v.as_str())
@@ -331,6 +350,7 @@ async fn handle_hooks_invoke(
     let session = match session {
         Some(s) => s,
         None => {
+            sdk_dlog!("handle_hooks_invoke: SESSION NOT FOUND for {session_id}");
             return Err(CopilotError::Protocol(format!(
                 "Session not found for hooks invoke: {session_id}"
             )));
@@ -343,8 +363,11 @@ async fn handle_hooks_invoke(
         .unwrap_or("");
 
     let input = params.get("input").cloned().unwrap_or(Value::Null);
+    sdk_dlog!("handle_hooks_invoke: hook_type={hook_type}");
 
-    session.handle_hooks_invoke(hook_type, &input).await
+    let result = session.handle_hooks_invoke(hook_type, &input).await;
+    sdk_dlog!("handle_hooks_invoke: result={:?}", result.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()));
+    result
 }
 
 fn parse_cli_url(url: &str) -> Result<(String, u16)> {
@@ -692,6 +715,8 @@ impl Client {
 
     /// Create a new Copilot session.
     pub async fn create_session(&self, mut config: SessionConfig) -> Result<Arc<Session>> {
+        let bt = std::backtrace::Backtrace::force_capture();
+        sdk_dlog!("create_session CALLED — backtrace:\n{}", bt);
         self.ensure_connected().await?;
 
         // Apply BYOK from environment if enabled and not explicitly set
@@ -704,9 +729,11 @@ impl Client {
 
         // Build the request
         let params = serde_json::to_value(&config)?;
+        sdk_dlog!("session.create params: {}", serde_json::to_string_pretty(&params).unwrap_or_default());
 
         // Send the request
         let result = self.invoke("session.create", Some(params)).await?;
+        sdk_dlog!("session.create result: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
 
         // Extract session ID
         let session_id = result
@@ -734,6 +761,7 @@ impl Client {
         }
 
         // Store session
+        sdk_dlog!("create_session: storing session with id={}", session_id);
         self.sessions
             .write()
             .await
@@ -758,9 +786,11 @@ impl Client {
         // Build the request
         let mut params = serde_json::to_value(&config)?;
         params["sessionId"] = json!(session_id);
+        sdk_dlog!("session.resume params: {}", serde_json::to_string_pretty(&params).unwrap_or_default());
 
         // Send the request
         let result = self.invoke("session.resume", Some(params)).await?;
+        sdk_dlog!("session.resume result: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
 
         // Extract session ID from response
         let resumed_id = result
@@ -788,6 +818,7 @@ impl Client {
         }
 
         // Store session
+        sdk_dlog!("resume_session: storing session with id={}", resumed_id);
         self.sessions
             .write()
             .await
@@ -1302,6 +1333,7 @@ impl Client {
             let params = params.clone();
 
             Box::pin(async move {
+                sdk_dlog!("RPC request: method={} params={}", method, serde_json::to_string(&params).unwrap_or_default());
                 let result = match method.as_str() {
                     "tool.call" => handle_tool_call(&sessions, &params).await,
                     "permission.request" => handle_permission_request(&sessions, &params).await,
@@ -1315,7 +1347,10 @@ impl Client {
                     }
                 };
 
-                result.map_err(|e| JsonRpcError::new(-32000, e.to_string()))
+                result.map_err(|e| {
+                    sdk_dlog!("RPC request error: method={} error={}", method, e);
+                    JsonRpcError::new(-32000, e.to_string())
+                })
             })
         })
         .await;
