@@ -896,6 +896,8 @@ pub struct ResumeSessionConfig {
     pub skill_directories: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_skills: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "requestPermission")]
     pub request_permission: Option<bool>,
 
