@@ -1244,12 +1244,16 @@ impl Client {
             .map(|v| v as u32);
 
         if let Some(version) = protocol_version {
-            if version != SDK_PROTOCOL_VERSION {
+            if version < SDK_PROTOCOL_VERSION {
+                // Server is older than what the SDK requires — hard error.
                 return Err(CopilotError::ProtocolMismatch {
                     expected: SDK_PROTOCOL_VERSION,
                     actual: version,
                 });
             }
+            // Server version >= SDK version is accepted (backward-compatible).
+            // The runtime may advertise a newer protocol (e.g. v3 broadcast events)
+            // while still supporting the v2 RPC callback pattern we use.
         }
 
         Ok(())
