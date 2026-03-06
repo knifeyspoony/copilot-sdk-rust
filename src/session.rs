@@ -227,6 +227,12 @@ impl Session {
     ///
     /// This is called by the Client when events are received.
     pub async fn dispatch_event(&self, event: SessionEvent) {
+        // Handle v3 broadcast request events internally (fire-and-forget).
+        // The runtime (protocol v3) sends permission and tool call requests as
+        // session events instead of RPC callbacks. We intercept them here,
+        // run the registered handler, and respond via the new RPC methods.
+        self.handle_broadcast_event(&event);
+
         // Send to broadcast channel
         let _ = self.event_tx.send(event.clone());
 
@@ -234,6 +240,150 @@ impl Session {
         let state = self.state.read().await;
         for handler in state.event_handlers.values() {
             handler(&event);
+        }
+    }
+
+    /// Handle v3 broadcast request events (permission.requested, external_tool.requested).
+    ///
+    /// Dispatches as fire-and-forget via tokio::spawn — matching the Node SDK's
+    /// `void this._handleBroadcastEvent(event)` pattern.
+    fn handle_broadcast_event(&self, event: &SessionEvent) {
+        match event.event_type.as_str() {
+            "permission.requested" => {
+                if let SessionEventData::Unknown(data) = &event.data {
+                    let data = data.clone();
+                    let session_id = self.session_id.clone();
+                    let state = Arc::clone(&self.state);
+                    let invoke_fn = Arc::clone(&self.invoke_fn);
+                    tokio::spawn(async move {
+                        Self::handle_permission_broadcast(session_id, state, invoke_fn, &data).await;
+                    });
+                }
+            }
+            "external_tool.requested" => {
+                if let SessionEventData::Unknown(data) = &event.data {
+                    let data = data.clone();
+                    let session_id = self.session_id.clone();
+                    let state = Arc::clone(&self.state);
+                    let invoke_fn = Arc::clone(&self.invoke_fn);
+                    tokio::spawn(async move {
+                        Self::handle_tool_broadcast(session_id, state, invoke_fn, &data).await;
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle a v3 permission.requested broadcast event.
+    async fn handle_permission_broadcast(
+        session_id: String,
+        state: Arc<RwLock<SessionState>>,
+        invoke_fn: Arc<InvokeFn>,
+        data: &Value,
+    ) {
+        let request_id = match data.get("requestId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                sdk_dlog!("permission.requested: missing requestId");
+                return;
+            }
+        };
+
+        let perm_request = match data.get("permissionRequest") {
+            Some(pr) => match serde_json::from_value::<PermissionRequest>(pr.clone()) {
+                Ok(req) => req,
+                Err(e) => {
+                    sdk_dlog!("permission.requested: failed to parse permissionRequest: {e}");
+                    return;
+                }
+            },
+            None => {
+                sdk_dlog!("permission.requested: missing permissionRequest field");
+                return;
+            }
+        };
+
+        // Run the permission handler
+        let result = {
+            let state = state.read().await;
+            if let Some(handler) = &state.permission_handler {
+                sdk_dlog!("permission.requested: calling handler for kind={}", perm_request.kind);
+                handler(&perm_request)
+            } else {
+                sdk_dlog!("permission.requested: no handler — default deny");
+                PermissionRequestResult::denied()
+            }
+        };
+        sdk_dlog!("permission.requested: handler returned kind={}", result.kind);
+
+        // Respond via the v3 RPC method
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "requestId": request_id,
+            "result": result,
+        });
+        if let Err(e) = invoke_fn(
+            "session.permissions.handlePendingPermissionRequest",
+            Some(params),
+        ).await {
+            sdk_dlog!("permission.requested: RPC response error: {e}");
+        }
+    }
+
+    /// Handle a v3 external_tool.requested broadcast event.
+    async fn handle_tool_broadcast(
+        session_id: String,
+        state: Arc<RwLock<SessionState>>,
+        invoke_fn: Arc<InvokeFn>,
+        data: &Value,
+    ) {
+        let request_id = match data.get("requestId").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => {
+                sdk_dlog!("external_tool.requested: missing requestId");
+                return;
+            }
+        };
+        let tool_name = match data.get("toolName").and_then(|v| v.as_str()) {
+            Some(n) => n.to_string(),
+            None => {
+                sdk_dlog!("external_tool.requested: missing toolName");
+                return;
+            }
+        };
+        let arguments = data.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
+        let _tool_call_id = data.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Find and invoke the tool handler
+        let handler = {
+            let state = state.read().await;
+            state.tools.get(&tool_name)
+                .and_then(|rt| rt.handler.clone())
+        };
+
+        let params = if let Some(handler) = handler {
+            sdk_dlog!("external_tool.requested: invoking handler for tool={tool_name}");
+            let result = handler(&tool_name, &arguments);
+            // Serialize the result as a string (matching Node SDK behavior)
+            let result_str = serde_json::to_string(&result).unwrap_or_default();
+            serde_json::json!({
+                "sessionId": session_id,
+                "requestId": request_id,
+                "result": result_str,
+            })
+        } else {
+            // No handler registered — don't respond (let another client handle it,
+            // or let the server time out). This matches the Node SDK behavior.
+            sdk_dlog!("external_tool.requested: no handler for tool={tool_name}, ignoring");
+            return;
+        };
+
+        if let Err(e) = invoke_fn(
+            "session.tools.handlePendingToolCall",
+            Some(params),
+        ).await {
+            sdk_dlog!("external_tool.requested: RPC response error: {e}");
         }
     }
 
