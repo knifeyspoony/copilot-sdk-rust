@@ -8,8 +8,8 @@
 use crate::error::{CopilotError, Result};
 use crate::events::SessionEvent;
 use crate::jsonrpc::{StdioJsonRpcClient, TcpJsonRpcClient};
-use crate::sdk_dlog;
 use crate::process::{CopilotProcess, ProcessOptions};
+use crate::sdk_dlog;
 use crate::session::Session;
 use crate::types::{
     ClientOptions, ConnectionState, GetAuthStatusResponse, GetForegroundSessionResponse,
@@ -215,7 +215,10 @@ async fn handle_permission_request(
     sessions: &RwLock<HashMap<String, Arc<Session>>>,
     params: &Value,
 ) -> Result<Value> {
-    sdk_dlog!("handle_permission_request: params={}", serde_json::to_string_pretty(params).unwrap_or_default());
+    sdk_dlog!(
+        "handle_permission_request: params={}",
+        serde_json::to_string_pretty(params).unwrap_or_default()
+    );
 
     let session_id = params
         .get("sessionId")
@@ -227,7 +230,11 @@ async fn handle_permission_request(
 
     let session = sessions.read().await.get(session_id).cloned();
     let known_ids: Vec<String> = sessions.read().await.keys().cloned().collect();
-    sdk_dlog!("handle_permission_request: looking for session_id={}, known_ids={:?}", session_id, known_ids);
+    sdk_dlog!(
+        "handle_permission_request: looking for session_id={}, known_ids={:?}",
+        session_id,
+        known_ids
+    );
 
     let session = match session {
         Some(s) => s,
@@ -272,7 +279,10 @@ async fn handle_permission_request(
     };
 
     let result = session.handle_permission_request(&request).await;
-    sdk_dlog!("handle_permission_request: handler returned kind={}", result.kind);
+    sdk_dlog!(
+        "handle_permission_request: handler returned kind={}",
+        result.kind
+    );
 
     // Build response
     let mut response = json!({
@@ -338,7 +348,10 @@ async fn handle_hooks_invoke(
     sessions: &RwLock<HashMap<String, Arc<Session>>>,
     params: &Value,
 ) -> Result<Value> {
-    sdk_dlog!("handle_hooks_invoke: params={}", serde_json::to_string_pretty(params).unwrap_or_default());
+    sdk_dlog!(
+        "handle_hooks_invoke: params={}",
+        serde_json::to_string_pretty(params).unwrap_or_default()
+    );
 
     let session_id = params
         .get("sessionId")
@@ -366,7 +379,12 @@ async fn handle_hooks_invoke(
     sdk_dlog!("handle_hooks_invoke: hook_type={hook_type}");
 
     let result = session.handle_hooks_invoke(hook_type, &input).await;
-    sdk_dlog!("handle_hooks_invoke: result={:?}", result.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default()));
+    sdk_dlog!(
+        "handle_hooks_invoke: result={:?}",
+        result
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+    );
     result
 }
 
@@ -729,11 +747,17 @@ impl Client {
 
         // Build the request
         let params = serde_json::to_value(&config)?;
-        sdk_dlog!("session.create params: {}", serde_json::to_string_pretty(&params).unwrap_or_default());
+        sdk_dlog!(
+            "session.create params: {}",
+            serde_json::to_string_pretty(&params).unwrap_or_default()
+        );
 
         // Send the request
         let result = self.invoke("session.create", Some(params)).await?;
-        sdk_dlog!("session.create result: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        sdk_dlog!(
+            "session.create result: {}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
 
         // Extract session ID
         let session_id = result
@@ -786,11 +810,17 @@ impl Client {
         // Build the request
         let mut params = serde_json::to_value(&config)?;
         params["sessionId"] = json!(session_id);
-        sdk_dlog!("session.resume params: {}", serde_json::to_string_pretty(&params).unwrap_or_default());
+        sdk_dlog!(
+            "session.resume params: {}",
+            serde_json::to_string_pretty(&params).unwrap_or_default()
+        );
 
         // Send the request
         let result = self.invoke("session.resume", Some(params)).await?;
-        sdk_dlog!("session.resume result: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+        sdk_dlog!(
+            "session.resume result: {}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
 
         // Extract session ID from response
         let resumed_id = result
@@ -1272,7 +1302,8 @@ impl Client {
         // Use an unbounded channel to serialize event processing — the CLI
         // sends events in causal order (parent before child) and we must
         // preserve that order. Spawning a task per notification would race.
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<(String, serde_json::Value)>();
+        let (evt_tx, mut evt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, serde_json::Value)>();
         {
             let sessions = Arc::clone(&sessions);
             tokio::spawn(async move {
@@ -1290,7 +1321,10 @@ impl Client {
                                 session.dispatch_event(event).await;
                             }
                             Err(err) => {
-                                let etype = event_data.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                                let etype = event_data
+                                    .get("type")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("?");
                                 sdk_dlog!("dispatch: PARSE ERROR type={etype}: {err}");
                             }
                         }
@@ -1303,7 +1337,10 @@ impl Client {
             if method == "session.event" {
                 if let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) {
                     if let Some(event_data) = params.get("event") {
-                        let etype = event_data.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                        let etype = event_data
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("?");
                         sdk_dlog!("notification: session.event type={etype}");
                         let _ = evt_tx.send((session_id.to_string(), event_data.clone()));
                     }
@@ -1337,7 +1374,11 @@ impl Client {
             let params = params.clone();
 
             Box::pin(async move {
-                sdk_dlog!("RPC request: method={} params={}", method, serde_json::to_string(&params).unwrap_or_default());
+                sdk_dlog!(
+                    "RPC request: method={} params={}",
+                    method,
+                    serde_json::to_string(&params).unwrap_or_default()
+                );
                 let result = match method.as_str() {
                     "tool.call" => handle_tool_call(&sessions, &params).await,
                     "permission.request" => handle_permission_request(&sessions, &params).await,

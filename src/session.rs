@@ -256,7 +256,8 @@ impl Session {
                     let state = Arc::clone(&self.state);
                     let invoke_fn = Arc::clone(&self.invoke_fn);
                     tokio::spawn(async move {
-                        Self::handle_permission_broadcast(session_id, state, invoke_fn, &data).await;
+                        Self::handle_permission_broadcast(session_id, state, invoke_fn, &data)
+                            .await;
                     });
                 }
             }
@@ -308,14 +309,20 @@ impl Session {
         let result = {
             let state = state.read().await;
             if let Some(handler) = &state.permission_handler {
-                sdk_dlog!("permission.requested: calling handler for kind={}", perm_request.kind);
+                sdk_dlog!(
+                    "permission.requested: calling handler for kind={}",
+                    perm_request.kind
+                );
                 handler(&perm_request)
             } else {
                 sdk_dlog!("permission.requested: no handler — default deny");
                 PermissionRequestResult::denied()
             }
         };
-        sdk_dlog!("permission.requested: handler returned kind={}", result.kind);
+        sdk_dlog!(
+            "permission.requested: handler returned kind={}",
+            result.kind
+        );
 
         // Respond via the v3 RPC method
         let params = serde_json::json!({
@@ -326,7 +333,9 @@ impl Session {
         if let Err(e) = invoke_fn(
             "session.permissions.handlePendingPermissionRequest",
             Some(params),
-        ).await {
+        )
+        .await
+        {
             sdk_dlog!("permission.requested: RPC response error: {e}");
         }
     }
@@ -352,13 +361,21 @@ impl Session {
                 return;
             }
         };
-        let arguments = data.get("arguments").cloned().unwrap_or(Value::Object(Default::default()));
-        let _tool_call_id = data.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("");
+        let arguments = data
+            .get("arguments")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
+        let _tool_call_id = data
+            .get("toolCallId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // Find and invoke the tool handler
         let handler = {
             let state = state.read().await;
-            state.tools.get(&tool_name)
+            state
+                .tools
+                .get(&tool_name)
                 .and_then(|rt| rt.handler.clone())
         };
 
@@ -379,10 +396,7 @@ impl Session {
             return;
         };
 
-        if let Err(e) = invoke_fn(
-            "session.tools.handlePendingToolCall",
-            Some(params),
-        ).await {
+        if let Err(e) = invoke_fn("session.tools.handlePendingToolCall", Some(params)).await {
             sdk_dlog!("external_tool.requested: RPC response error: {e}");
         }
     }
@@ -436,7 +450,8 @@ impl Session {
             for (i, v) in arr.iter().enumerate() {
                 match SessionEvent::from_json(v) {
                     Ok(ev) => {
-                        let ptcid = v.get("data")
+                        let ptcid = v
+                            .get("data")
                             .and_then(|d| d.get("parentToolCallId"))
                             .and_then(|t| t.as_str())
                             .unwrap_or("-");
@@ -451,9 +466,7 @@ impl Session {
                     }
                     Err(err) => {
                         let etype = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
-                        sdk_dlog!(
-                            "get_messages: PARSE ERROR event #{i} (type={etype}): {err}"
-                        );
+                        sdk_dlog!("get_messages: PARSE ERROR event #{i} (type={etype}): {err}");
                     }
                 }
             }
@@ -571,9 +584,15 @@ impl Session {
         let state = self.state.read().await;
 
         if let Some(handler) = &state.permission_handler {
-            sdk_dlog!("handle_permission_request: calling registered handler for kind={}", request.kind);
+            sdk_dlog!(
+                "handle_permission_request: calling registered handler for kind={}",
+                request.kind
+            );
             let result = handler(request);
-            sdk_dlog!("handle_permission_request: handler returned kind={}", result.kind);
+            sdk_dlog!(
+                "handle_permission_request: handler returned kind={}",
+                result.kind
+            );
             result
         } else {
             sdk_dlog!("handle_permission_request: NO handler registered — default deny");
