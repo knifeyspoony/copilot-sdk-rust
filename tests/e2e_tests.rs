@@ -1584,7 +1584,7 @@ async fn test_infinite_session_config() {
         .expect("Failed to create session with infinite config");
 
     // Check if workspace_path is provided (depends on server support)
-    if let Some(workspace_path) = session.workspace_path() {
+    if let Some(workspace_path) = session.workspace_path().await {
         println!("Infinite session workspace path: {}", workspace_path);
         // Workspace path should be a valid directory path
         assert!(

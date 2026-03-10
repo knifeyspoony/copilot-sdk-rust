@@ -745,6 +745,16 @@ impl Client {
             config.provider = ProviderConfig::from_env();
         }
 
+        // Generate session ID client-side so we can register before the RPC
+        if config.session_id.is_none() {
+            config.session_id = Some(uuid::Uuid::new_v4().to_string());
+        }
+        let session_id = config.session_id.clone().unwrap();
+
+        // Take callbacks before serializing (they are #[serde(skip)])
+        let on_event = config.on_event.take();
+        let hooks = config.hooks.take();
+
         // Build the request
         let params = serde_json::to_value(&config)?;
         sdk_dlog!(
@@ -752,44 +762,53 @@ impl Client {
             serde_json::to_string_pretty(&params).unwrap_or_default()
         );
 
-        // Send the request
-        let result = self.invoke("session.create", Some(params)).await?;
-        sdk_dlog!(
-            "session.create result: {}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
-
-        // Extract session ID
-        let session_id = result
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CopilotError::Protocol("Missing sessionId in response".into()))?
-            .to_string();
-
-        // Extract workspace_path (for infinite sessions)
-        let workspace_path = result
-            .get("workspacePath")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Create session object
+        // Create and register the session BEFORE the RPC so events emitted
+        // during session creation (e.g. session.start) are not dropped.
         let session = self
-            .create_session_object(session_id.clone(), workspace_path)
+            .create_session_object(session_id.clone(), None)
             .await;
 
+        // Register on_event handler before the RPC
+        if let Some(handler) = on_event {
+            let _ = session.on(move |ev| (handler.0)(ev)).await;
+        }
+
         // Register hooks from config if provided
-        if let Some(hooks) = config.hooks.take() {
+        if let Some(hooks) = hooks {
             if hooks.has_any() {
                 session.register_hooks(hooks).await;
             }
         }
 
-        // Store session
-        sdk_dlog!("create_session: storing session with id={}", session_id);
+        // Store session before the RPC
+        sdk_dlog!("create_session: pre-registering session with id={}", session_id);
         self.sessions
             .write()
             .await
-            .insert(session_id, Arc::clone(&session));
+            .insert(session_id.clone(), Arc::clone(&session));
+
+        // Send the request
+        let result = match self.invoke("session.create", Some(params)).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Clean up on RPC failure
+                self.sessions.write().await.remove(&session_id);
+                return Err(e);
+            }
+        };
+        sdk_dlog!(
+            "session.create result: {}",
+            serde_json::to_string_pretty(&result).unwrap_or_default()
+        );
+
+        // Set workspace_path from the response
+        let workspace_path = result
+            .get("workspacePath")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(wp) = workspace_path {
+            session.set_workspace_path(wp).await;
+        }
 
         Ok(session)
     }
@@ -807,6 +826,10 @@ impl Client {
             config.provider = ProviderConfig::from_env();
         }
 
+        // Take callbacks before serializing
+        let on_event = config.on_event.take();
+        let hooks = config.hooks.take();
+
         // Build the request
         let mut params = serde_json::to_value(&config)?;
         params["sessionId"] = json!(session_id);
@@ -815,44 +838,66 @@ impl Client {
             serde_json::to_string_pretty(&params).unwrap_or_default()
         );
 
+        // Create and register the session BEFORE the RPC
+        let session = self
+            .create_session_object(session_id.to_string(), None)
+            .await;
+
+        // Register on_event handler before the RPC
+        if let Some(handler) = on_event {
+            let _ = session.on(move |ev| (handler.0)(ev)).await;
+        }
+
+        // Register hooks from config if provided
+        if let Some(hooks) = hooks {
+            if hooks.has_any() {
+                session.register_hooks(hooks).await;
+            }
+        }
+
+        // Store session before the RPC
+        sdk_dlog!("resume_session: pre-registering session with id={}", session_id);
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), Arc::clone(&session));
+
         // Send the request
-        let result = self.invoke("session.resume", Some(params)).await?;
+        let result = match self.invoke("session.resume", Some(params)).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.write().await.remove(session_id);
+                return Err(e);
+            }
+        };
         sdk_dlog!(
             "session.resume result: {}",
             serde_json::to_string_pretty(&result).unwrap_or_default()
         );
 
-        // Extract session ID from response
+        // The response may return a different session ID
         let resumed_id = result
             .get("sessionId")
             .and_then(|v| v.as_str())
             .unwrap_or(session_id)
             .to_string();
 
-        // Extract workspace_path (for infinite sessions)
+        // If the server returned a different ID, re-key in the map
+        if resumed_id != session_id {
+            let mut sessions = self.sessions.write().await;
+            if let Some(s) = sessions.remove(session_id) {
+                sessions.insert(resumed_id.clone(), s);
+            }
+        }
+
+        // Set workspace_path from the response
         let workspace_path = result
             .get("workspacePath")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-
-        // Create session object
-        let session = self
-            .create_session_object(resumed_id.clone(), workspace_path)
-            .await;
-
-        // Register hooks from config if provided
-        if let Some(hooks) = config.hooks.take() {
-            if hooks.has_any() {
-                session.register_hooks(hooks).await;
-            }
+        if let Some(wp) = workspace_path {
+            session.set_workspace_path(wp).await;
         }
-
-        // Store session
-        sdk_dlog!("resume_session: storing session with id={}", resumed_id);
-        self.sessions
-            .write()
-            .await
-            .insert(resumed_id, Arc::clone(&session));
 
         Ok(session)
     }

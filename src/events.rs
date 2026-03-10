@@ -619,6 +619,172 @@ pub struct AssistantStreamingDeltaData {
 }
 
 // =============================================================================
+// Protocol v3 broadcast events
+// =============================================================================
+
+/// Data for external_tool.requested event (v3 broadcast).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalToolRequestedData {
+    pub request_id: String,
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// Data for external_tool.completed event (v3 broadcast).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalToolCompletedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+/// Data for permission.requested event (v3 broadcast).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRequestedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_request: Option<serde_json::Value>,
+}
+
+/// Data for permission.completed event (v3 broadcast).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionCompletedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+// =============================================================================
+// Command events
+// =============================================================================
+
+/// Data for command.queued event (slash command queued for execution).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandQueuedData {
+    pub request_id: String,
+    pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions: Option<Vec<String>>,
+}
+
+/// Data for command.completed event (slash command completed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandCompletedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+// =============================================================================
+// Elicitation events
+// =============================================================================
+
+/// Data for elicitation.requested event (form-based user input).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationRequestedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+}
+
+/// Data for elicitation.completed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationCompletedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+// =============================================================================
+// Exit plan mode events
+// =============================================================================
+
+/// Data for exit_plan_mode.requested event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExitPlanModeRequestedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_action: Option<String>,
+}
+
+/// Data for exit_plan_mode.completed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExitPlanModeCompletedData {
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+// =============================================================================
+// User input broadcast events
+// =============================================================================
+
+/// Data for user_input.requested event (v3 broadcast).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputRequestedData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choices: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_freeform: Option<bool>,
+}
+
+/// Data for user_input.completed event (v3 broadcast).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputCompletedData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+}
+
+// =============================================================================
+// Subagent deselected + system notification
+// =============================================================================
+
+/// Data for subagent.deselected event.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubagentDeselectedData {}
+
+/// Data for system.notification event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemNotificationData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_type: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+// =============================================================================
 // Session Event (Discriminated Union)
 // =============================================================================
 
@@ -654,9 +820,11 @@ pub enum SessionEventData {
     CustomAgentCompleted(CustomAgentCompletedData),
     CustomAgentFailed(CustomAgentFailedData),
     CustomAgentSelected(CustomAgentSelectedData),
+    SubagentDeselected(SubagentDeselectedData),
     HookStart(HookStartData),
     HookEnd(HookEndData),
     SystemMessage(SystemMessageEventData),
+    SystemNotification(SystemNotificationData),
     SessionCompactionStart(SessionCompactionStartData),
     SessionCompactionComplete(SessionCompactionCompleteData),
     SessionShutdown(SessionShutdownData),
@@ -671,6 +839,23 @@ pub enum SessionEventData {
     SessionWarning(SessionWarningData),
     SessionWorkspaceFileChanged(SessionWorkspaceFileChangedData),
     AssistantStreamingDelta(AssistantStreamingDeltaData),
+    // Protocol v3 broadcast events
+    ExternalToolRequested(ExternalToolRequestedData),
+    ExternalToolCompleted(ExternalToolCompletedData),
+    PermissionRequested(PermissionRequestedData),
+    PermissionCompleted(PermissionCompletedData),
+    // Command events
+    CommandQueued(CommandQueuedData),
+    CommandCompleted(CommandCompletedData),
+    // Elicitation events
+    ElicitationRequested(ElicitationRequestedData),
+    ElicitationCompleted(ElicitationCompletedData),
+    // Exit plan mode events
+    ExitPlanModeRequested(ExitPlanModeRequestedData),
+    ExitPlanModeCompleted(ExitPlanModeCompletedData),
+    // User input broadcast events
+    UserInputRequested(UserInputRequestedData),
+    UserInputCompleted(UserInputCompletedData),
     /// Unknown event - preserves raw JSON for forward compatibility.
     Unknown(serde_json::Value),
 }
@@ -897,6 +1082,9 @@ fn parse_event_data(event_type: &str, data: serde_json::Value) -> SessionEventDa
         "subagent.selected" | "custom_agent.selected" => serde_json::from_value(data)
             .map(SessionEventData::CustomAgentSelected)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "subagent.deselected" => {
+            SessionEventData::SubagentDeselected(SubagentDeselectedData {})
+        }
         "hook.start" => serde_json::from_value(data)
             .map(SessionEventData::HookStart)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
@@ -905,6 +1093,9 @@ fn parse_event_data(event_type: &str, data: serde_json::Value) -> SessionEventDa
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         "system.message" => serde_json::from_value(data)
             .map(SessionEventData::SystemMessage)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "system.notification" => serde_json::from_value(data)
+            .map(SessionEventData::SystemNotification)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         "session.compaction_start" => {
             SessionEventData::SessionCompactionStart(SessionCompactionStartData {})
@@ -944,6 +1135,47 @@ fn parse_event_data(event_type: &str, data: serde_json::Value) -> SessionEventDa
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         "session.workspace_file_changed" => serde_json::from_value(data)
             .map(SessionEventData::SessionWorkspaceFileChanged)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        // Protocol v3 broadcast events
+        "external_tool.requested" => serde_json::from_value(data)
+            .map(SessionEventData::ExternalToolRequested)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "external_tool.completed" => serde_json::from_value(data)
+            .map(SessionEventData::ExternalToolCompleted)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "permission.requested" => serde_json::from_value(data)
+            .map(SessionEventData::PermissionRequested)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "permission.completed" => serde_json::from_value(data)
+            .map(SessionEventData::PermissionCompleted)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        // Command events (slash commands)
+        "command.queued" => serde_json::from_value(data)
+            .map(SessionEventData::CommandQueued)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "command.completed" => serde_json::from_value(data)
+            .map(SessionEventData::CommandCompleted)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        // Elicitation events (form-based user input)
+        "elicitation.requested" => serde_json::from_value(data)
+            .map(SessionEventData::ElicitationRequested)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "elicitation.completed" => serde_json::from_value(data)
+            .map(SessionEventData::ElicitationCompleted)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        // Exit plan mode events
+        "exit_plan_mode.requested" => serde_json::from_value(data)
+            .map(SessionEventData::ExitPlanModeRequested)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "exit_plan_mode.completed" => serde_json::from_value(data)
+            .map(SessionEventData::ExitPlanModeCompleted)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        // User input broadcast events
+        "user_input.requested" => serde_json::from_value(data)
+            .map(SessionEventData::UserInputRequested)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "user_input.completed" => serde_json::from_value(data)
+            .map(SessionEventData::UserInputCompleted)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         // Unknown event type - preserve raw data
         _ => SessionEventData::Unknown(data),

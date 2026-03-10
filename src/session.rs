@@ -9,8 +9,8 @@ use crate::error::{CopilotError, Result};
 use crate::events::{SessionEvent, SessionEventData};
 use crate::sdk_dlog;
 use crate::types::{
-    ErrorOccurredHookInput, MessageOptions, PermissionRequest, PermissionRequestResult,
-    PostToolUseHookInput, PreToolUseHookInput, SessionEndHookInput, SessionHooks,
+    ErrorOccurredHookInput, LogOptions, MessageOptions, PermissionRequest, PermissionRequestResult,
+    PostToolUseHookInput, PreToolUseHookInput, SessionEndHookInput, SessionHooks, SessionLogLevel,
     SessionStartHookInput, Tool, ToolResultObject, UserInputInvocation, UserInputRequest,
     UserInputResponse, UserPromptSubmittedHookInput,
 };
@@ -131,8 +131,8 @@ struct SessionState {
 pub struct Session {
     /// Session ID.
     session_id: String,
-    /// Workspace path for infinite sessions.
-    workspace_path: Option<String>,
+    /// Workspace path for infinite sessions (set after RPC completes).
+    workspace_path: RwLock<Option<String>>,
     /// Event broadcaster.
     event_tx: broadcast::Sender<SessionEvent>,
     /// Session state.
@@ -153,7 +153,7 @@ impl Session {
 
         Self {
             session_id,
-            workspace_path,
+            workspace_path: RwLock::new(workspace_path),
             event_tx,
             state: Arc::new(RwLock::new(SessionState {
                 tools: HashMap::new(),
@@ -180,8 +180,13 @@ impl Session {
     ///
     /// Contains checkpoints/, plan.md, and files/ subdirectories.
     /// Returns None if infinite sessions are disabled.
-    pub fn workspace_path(&self) -> Option<&str> {
-        self.workspace_path.as_deref()
+    pub async fn workspace_path(&self) -> Option<String> {
+        self.workspace_path.read().await.clone()
+    }
+
+    /// Set the workspace path (called after session.create/resume RPC completes).
+    pub async fn set_workspace_path(&self, path: String) {
+        *self.workspace_path.write().await = Some(path);
     }
 
     // =========================================================================
@@ -250,27 +255,36 @@ impl Session {
     fn handle_broadcast_event(&self, event: &SessionEvent) {
         match event.event_type.as_str() {
             "permission.requested" => {
-                if let SessionEventData::Unknown(data) = &event.data {
-                    let data = data.clone();
-                    let session_id = self.session_id.clone();
-                    let state = Arc::clone(&self.state);
-                    let invoke_fn = Arc::clone(&self.invoke_fn);
-                    tokio::spawn(async move {
-                        Self::handle_permission_broadcast(session_id, state, invoke_fn, &data)
-                            .await;
-                    });
-                }
+                // Re-serialize the typed data back to Value for the handler
+                let data = match &event.data {
+                    SessionEventData::PermissionRequested(d) => {
+                        serde_json::to_value(d).unwrap_or(serde_json::Value::Null)
+                    }
+                    SessionEventData::Unknown(d) => d.clone(),
+                    _ => return,
+                };
+                let session_id = self.session_id.clone();
+                let state = Arc::clone(&self.state);
+                let invoke_fn = Arc::clone(&self.invoke_fn);
+                tokio::spawn(async move {
+                    Self::handle_permission_broadcast(session_id, state, invoke_fn, &data)
+                        .await;
+                });
             }
             "external_tool.requested" => {
-                if let SessionEventData::Unknown(data) = &event.data {
-                    let data = data.clone();
-                    let session_id = self.session_id.clone();
-                    let state = Arc::clone(&self.state);
-                    let invoke_fn = Arc::clone(&self.invoke_fn);
-                    tokio::spawn(async move {
-                        Self::handle_tool_broadcast(session_id, state, invoke_fn, &data).await;
-                    });
-                }
+                let data = match &event.data {
+                    SessionEventData::ExternalToolRequested(d) => {
+                        serde_json::to_value(d).unwrap_or(serde_json::Value::Null)
+                    }
+                    SessionEventData::Unknown(d) => d.clone(),
+                    _ => return,
+                };
+                let session_id = self.session_id.clone();
+                let state = Arc::clone(&self.state);
+                let invoke_fn = Arc::clone(&self.invoke_fn);
+                tokio::spawn(async move {
+                    Self::handle_tool_broadcast(session_id, state, invoke_fn, &data).await;
+                });
             }
             _ => {}
         }
@@ -746,6 +760,69 @@ impl Session {
     }
 
     // =========================================================================
+    // Model & Logging
+    // =========================================================================
+
+    /// Switch the model used by this session.
+    ///
+    /// Sends a `session.model.switchTo` RPC call.
+    pub async fn set_model(&self, model: &str) -> Result<()> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "modelId": model,
+        });
+
+        (self.invoke_fn)("session.model.switchTo", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Switch the model and reasoning effort used by this session.
+    pub async fn set_model_with_effort(
+        &self,
+        model: &str,
+        reasoning_effort: &str,
+    ) -> Result<()> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+            "modelId": model,
+            "reasoningEffort": reasoning_effort,
+        });
+
+        (self.invoke_fn)("session.model.switchTo", Some(params)).await?;
+        Ok(())
+    }
+
+    /// Send a log message to the session timeline.
+    ///
+    /// The message appears in the session event stream. Non-ephemeral messages
+    /// are persisted to the session event log on disk.
+    ///
+    /// Returns the event ID of the emitted log event.
+    pub async fn log(&self, message: &str, opts: Option<&LogOptions>) -> Result<String> {
+        let mut params = serde_json::json!({
+            "sessionId": self.session_id,
+            "message": message,
+        });
+
+        if let Some(opts) = opts {
+            if opts.level != SessionLogLevel::Info {
+                params["level"] = serde_json::json!(opts.level.as_str());
+            }
+            if opts.ephemeral {
+                params["ephemeral"] = serde_json::json!(true);
+            }
+        }
+
+        let result = (self.invoke_fn)("session.log", Some(params)).await?;
+
+        result
+            .get("eventId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| CopilotError::Protocol("Missing eventId in session.log response".into()))
+    }
+
+    // =========================================================================
     // Lifecycle
     // =========================================================================
 
@@ -924,7 +1001,7 @@ mod tests {
             Some("/tmp/workspace".to_string()),
             mock_invoke,
         );
-        assert_eq!(session.workspace_path(), Some("/tmp/workspace"));
+        assert_eq!(session.workspace_path().await.as_deref(), Some("/tmp/workspace"));
     }
 
     #[tokio::test]

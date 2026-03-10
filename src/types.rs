@@ -12,6 +12,32 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Callback registered before session creation/resume to receive early events.
+/// Wraps `Arc<dyn Fn>` so it can be stored in `#[derive(Clone)]` config structs.
+#[derive(Clone)]
+pub struct OnEventHandler(pub Arc<dyn Fn(&crate::events::SessionEvent) + Send + Sync>);
+
+impl OnEventHandler {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&crate::events::SessionEvent) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for OnEventHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnEventHandler(..)")
+    }
+}
+
+impl Default for OnEventHandler {
+    fn default() -> Self {
+        Self(Arc::new(|_| {}))
+    }
+}
+
 // =============================================================================
 // Protocol Version
 // =============================================================================
@@ -244,6 +270,34 @@ impl PermissionRequestResult {
 // Configuration Types
 // =============================================================================
 
+/// Log severity level for `Session::log()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionLogLevel {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+impl SessionLogLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionLogLevel::Info => "info",
+            SessionLogLevel::Warning => "warning",
+            SessionLogLevel::Error => "error",
+        }
+    }
+}
+
+/// Options for `Session::log()`.
+#[derive(Debug, Clone, Default)]
+pub struct LogOptions {
+    /// Log severity level. Defaults to `Info`.
+    pub level: SessionLogLevel,
+    /// When true, the message is transient and not persisted to the session event log on disk.
+    pub ephemeral: bool,
+}
+
 /// System message configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -466,6 +520,9 @@ pub struct Tool {
     pub name: String,
     pub description: String,
     pub parameters_schema: serde_json::Value,
+    /// When true, this tool overrides a built-in tool with the same name.
+    /// Without this flag, the runtime returns an error on name collision.
+    pub overrides_built_in_tool: bool,
     // Handler is stored separately in Session since it's not Clone-friendly
 }
 
@@ -476,6 +533,7 @@ impl Tool {
             name: name.into(),
             description: String::new(),
             parameters_schema: serde_json::json!({}),
+            overrides_built_in_tool: false,
         }
     }
 
@@ -488,6 +546,12 @@ impl Tool {
     /// Set the parameters JSON schema.
     pub fn schema(mut self, schema: serde_json::Value) -> Self {
         self.parameters_schema = schema;
+        self
+    }
+
+    /// Mark this tool as overriding a built-in tool with the same name.
+    pub fn overrides_built_in(mut self) -> Self {
+        self.overrides_built_in_tool = true;
         self
     }
 
@@ -559,10 +623,14 @@ impl Serialize for Tool {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("Tool", 3)?;
+        let field_count = if self.overrides_built_in_tool { 4 } else { 3 };
+        let mut state = serializer.serialize_struct("Tool", field_count)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("description", &self.description)?;
         state.serialize_field("parameters", &self.parameters_schema)?;
+        if self.overrides_built_in_tool {
+            state.serialize_field("overridesBuiltInTool", &true)?;
+        }
         state.end()
     }
 }
@@ -817,6 +885,9 @@ impl std::fmt::Debug for SessionHooks {
 pub struct SessionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Identifies the application using the SDK (included in User-Agent header).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -837,6 +908,10 @@ pub struct SessionConfig {
     pub mcp_servers: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agents: Option<Vec<CustomAgentConfig>>,
+    /// Name of the custom agent to activate when the session starts.
+    /// Must match the `name` of one of the agents in `custom_agents`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_directories: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -875,15 +950,30 @@ pub struct SessionConfig {
     /// Default: false (explicit configuration preferred over environment variables)
     #[serde(skip)]
     pub auto_byok_from_env: bool,
+
+    /// Optional event handler registered before the session.create RPC is issued.
+    /// This guarantees that early events emitted by the CLI during session creation
+    /// (e.g. `session.start`) are delivered to the handler.
+    #[serde(skip)]
+    pub on_event: Option<OnEventHandler>,
 }
 /// Configuration for resuming an existing session.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumeSessionConfig {
+    /// Identifies the application using the SDK (included in User-Agent header).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<SystemMessageConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -892,12 +982,16 @@ pub struct ResumeSessionConfig {
     pub mcp_servers: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_agents: Option<Vec<CustomAgentConfig>>,
+    /// Name of the custom agent to activate when resuming.
+    /// Must match the `name` of one of the agents in `custom_agents`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skill_directories: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disabled_skills: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub excluded_tools: Option<Vec<String>>,
+    pub config_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "requestPermission")]
     pub request_permission: Option<bool>,
 
@@ -913,7 +1007,8 @@ pub struct ResumeSessionConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_directory: Option<String>,
 
-    /// If true, skip resuming and create a new session instead.
+    /// If true, skip emitting the session.resume event.
+    /// Useful for reconnecting without triggering resume side effects.
     #[serde(default, skip_serializing_if = "is_false")]
     pub disable_resume: bool,
 
@@ -934,6 +1029,11 @@ pub struct ResumeSessionConfig {
     /// Default: false (explicit configuration preferred over environment variables)
     #[serde(skip)]
     pub auto_byok_from_env: bool,
+
+    /// Optional event handler registered before the session.resume RPC is issued.
+    /// See `SessionConfig::on_event`.
+    #[serde(skip)]
+    pub on_event: Option<OnEventHandler>,
 }
 
 /// Options for sending a message.
