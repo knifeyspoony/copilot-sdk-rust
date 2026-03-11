@@ -10,7 +10,7 @@ use crate::events::SessionEvent;
 use crate::jsonrpc::{StdioJsonRpcClient, TcpJsonRpcClient};
 use crate::process::{CopilotProcess, ProcessOptions};
 use crate::sdk_dlog;
-use crate::session::Session;
+use crate::session::{EventSubscription, Session};
 use crate::types::{
     ClientOptions, ConnectionState, GetAuthStatusResponse, GetForegroundSessionResponse,
     GetStatusResponse, LogLevel, ModelInfo, PingResponse, ProviderConfig, ResumeSessionConfig,
@@ -811,6 +811,133 @@ impl Client {
         }
 
         Ok(session)
+    }
+
+    /// Create a new session and return a pre-created event subscription.
+    ///
+    /// The subscription is created BEFORE the `session.create` RPC is issued,
+    /// guaranteeing that no events are missed (including `session.start`).
+    /// This is the preferred method for callers that process the event stream.
+    pub async fn create_session_with_subscription(
+        &self,
+        mut config: SessionConfig,
+    ) -> Result<(Arc<Session>, EventSubscription)> {
+        self.ensure_connected().await?;
+
+        if config.auto_byok_from_env && config.model.is_none() {
+            config.model = ProviderConfig::model_from_env();
+        }
+        if config.auto_byok_from_env && config.provider.is_none() {
+            config.provider = ProviderConfig::from_env();
+        }
+        if config.session_id.is_none() {
+            config.session_id = Some(uuid::Uuid::new_v4().to_string());
+        }
+        let session_id = config.session_id.clone().unwrap();
+
+        let on_event = config.on_event.take();
+        let hooks = config.hooks.take();
+        let params = serde_json::to_value(&config)?;
+
+        let session = self
+            .create_session_object(session_id.clone(), None)
+            .await;
+
+        // Subscribe BEFORE the RPC — this is the key difference from create_session().
+        let events = session.subscribe();
+
+        if let Some(handler) = on_event {
+            let _ = session.on(move |ev| (handler.0)(ev)).await;
+        }
+        if let Some(hooks) = hooks {
+            if hooks.has_any() {
+                session.register_hooks(hooks).await;
+            }
+        }
+
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.clone(), Arc::clone(&session));
+
+        let result = match self.invoke("session.create", Some(params)).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.write().await.remove(&session_id);
+                return Err(e);
+            }
+        };
+
+        let workspace_path = result
+            .get("workspacePath")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(wp) = workspace_path {
+            session.set_workspace_path(wp).await;
+        }
+
+        Ok((session, events))
+    }
+
+    /// Resume an existing session and return a pre-created event subscription.
+    ///
+    /// Same as [`resume_session`] but subscribes before the RPC to avoid
+    /// missing early events.
+    pub async fn resume_session_with_subscription(
+        &self,
+        session_id: &str,
+        mut config: ResumeSessionConfig,
+    ) -> Result<(Arc<Session>, EventSubscription)> {
+        self.ensure_connected().await?;
+
+        if config.auto_byok_from_env && config.provider.is_none() {
+            config.provider = ProviderConfig::from_env();
+        }
+
+        let on_event = config.on_event.take();
+        let hooks = config.hooks.take();
+
+        let mut params = serde_json::to_value(&config)?;
+        params["sessionId"] = json!(session_id);
+
+        let session = self
+            .create_session_object(session_id.to_string(), None)
+            .await;
+
+        // Subscribe BEFORE the RPC.
+        let events = session.subscribe();
+
+        if let Some(handler) = on_event {
+            let _ = session.on(move |ev| (handler.0)(ev)).await;
+        }
+        if let Some(hooks) = hooks {
+            if hooks.has_any() {
+                session.register_hooks(hooks).await;
+            }
+        }
+
+        self.sessions
+            .write()
+            .await
+            .insert(session_id.to_string(), Arc::clone(&session));
+
+        let result = match self.invoke("session.resume", Some(params)).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.sessions.write().await.remove(session_id);
+                return Err(e);
+            }
+        };
+
+        let workspace_path = result
+            .get("workspacePath")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(wp) = workspace_path {
+            session.set_workspace_path(wp).await;
+        }
+
+        Ok((session, events))
     }
 
     /// Resume an existing session.
