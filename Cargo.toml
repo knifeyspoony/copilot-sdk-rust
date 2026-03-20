@@ -39,6 +39,9 @@ tracing = "0.1"
 # Executable finding
 which = "7"
 
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
 schemars = { version = "0.8", optional = true, features = ["derive"] }
 
 [dev-dependencies]

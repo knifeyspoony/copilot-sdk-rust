@@ -401,7 +401,7 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
     }
 
     /// Dispatch an incoming message.
-    async fn dispatch_message(state: &SharedState<T>, message: Value) {
+    async fn dispatch_message(state: &Arc<SharedState<T>>, message: Value) {
         // Check if it's a response (has id and result/error, no method)
         if message.get("id").is_some()
             && !message.get("id").map(|v| v.is_null()).unwrap_or(true)
@@ -416,9 +416,15 @@ impl<T: Transport + 'static> JsonRpcClient<T> {
         if message.get("method").is_some() {
             if let Ok(request) = serde_json::from_value::<JsonRpcRequest>(message) {
                 if request.is_notification() {
+                    // Notifications run inline (no response needed).
                     Self::handle_notification(state, &request).await;
                 } else {
-                    Self::handle_request(state, &request).await;
+                    // Requests (calls) run in a spawned task so they don't
+                    // block the read loop — matches Go SDK's `go func()`.
+                    let state = Arc::clone(state);
+                    tokio::spawn(async move {
+                        Self::handle_request(&state, &request).await;
+                    });
                 }
             }
         }
@@ -711,7 +717,7 @@ impl StdioJsonRpcClient {
     }
 
     /// Dispatch an incoming message.
-    async fn dispatch_message(state: &StdioSharedState, message: Value) {
+    async fn dispatch_message(state: &Arc<StdioSharedState>, message: Value) {
         // Check if it's a response (has id and result/error, no method)
         if message.get("id").is_some()
             && !message.get("id").map(|v| v.is_null()).unwrap_or(true)
@@ -728,7 +734,10 @@ impl StdioJsonRpcClient {
                 if request.is_notification() {
                     Self::handle_notification(state, &request).await;
                 } else {
-                    Self::handle_request(state, &request).await;
+                    let state = Arc::clone(state);
+                    tokio::spawn(async move {
+                        Self::handle_request(&state, &request).await;
+                    });
                 }
             }
         }
@@ -1006,7 +1015,7 @@ impl TcpJsonRpcClient {
         writer.write_message(message).await
     }
 
-    async fn dispatch_message(state: &TcpSharedState, message: Value) {
+    async fn dispatch_message(state: &Arc<TcpSharedState>, message: Value) {
         if message.get("id").is_some()
             && !message.get("id").map(|v| v.is_null()).unwrap_or(true)
             && (message.get("result").is_some() || message.get("error").is_some())
@@ -1021,7 +1030,10 @@ impl TcpJsonRpcClient {
                 if request.is_notification() {
                     Self::handle_notification(state, &request).await;
                 } else {
-                    Self::handle_request(state, &request).await;
+                    let state = Arc::clone(state);
+                    tokio::spawn(async move {
+                        Self::handle_request(&state, &request).await;
+                    });
                 }
             }
         }

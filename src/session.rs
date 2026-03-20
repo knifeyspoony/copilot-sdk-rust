@@ -8,12 +8,12 @@
 use crate::error::{CopilotError, Result};
 use crate::events::{SessionEvent, SessionEventData};
 use crate::types::{
-    AgentInfo, ErrorOccurredHookInput, FleetStartOptions, LogOptions, LogResult, MessageOptions,
-    PermissionRequest, PermissionRequestResult, PlanData, PostToolUseHookInput,
-    PreToolUseHookInput, SessionEndHookInput, SessionHooks, SessionMode, SessionStartHookInput,
-    SetModelOptions, ShellExecOptions, ShellExecResult, ShellSignal, Tool, ToolResultObject,
-    UserInputInvocation, UserInputRequest, UserInputResponse, UserPromptSubmittedHookInput,
-    WorkspaceFile,
+    AgentInfo, ElicitationRequest, ElicitationResponse, ErrorOccurredHookInput, FleetStartOptions,
+    LogOptions, LogResult, MessageOptions, PermissionRequest, PermissionRequestResult, PlanData,
+    PostToolUseHookInput, PreToolUseHookInput, SessionEndHookInput, SessionHooks, SessionMode,
+    SessionStartHookInput, SetModelOptions, ShellExecOptions, ShellExecResult, ShellSignal, Tool,
+    ToolResultObject, UserInputInvocation, UserInputRequest, UserInputResponse,
+    UserPromptSubmittedHookInput, WorkspaceFile,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -39,6 +39,16 @@ pub type ToolHandler = Arc<dyn Fn(&str, &Value) -> ToolResultObject + Send + Syn
 /// Handler for user input requests.
 pub type UserInputHandler =
     Arc<dyn Fn(&UserInputRequest, &UserInputInvocation) -> UserInputResponse + Send + Sync>;
+
+/// Handler for elicitation requests (async — supports oneshot channel pattern).
+pub type ElicitationHandler = Arc<
+    dyn Fn(
+            ElicitationRequest,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = ElicitationResponse> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Type alias for the invoke future.
 pub type InvokeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>>;
@@ -88,6 +98,8 @@ struct SessionState {
     permission_handler: Option<PermissionHandler>,
     /// User input handler.
     user_input_handler: Option<UserInputHandler>,
+    /// Elicitation handler (async).
+    elicitation_handler: Option<ElicitationHandler>,
     /// Session hooks.
     hooks: Option<SessionHooks>,
     /// Callback-based event handlers.
@@ -132,8 +144,8 @@ struct SessionState {
 pub struct Session {
     /// Session ID.
     session_id: String,
-    /// Workspace path for infinite sessions.
-    workspace_path: Option<String>,
+    /// Workspace path for infinite sessions (set after RPC completes).
+    workspace_path: RwLock<Option<String>>,
     /// Event broadcaster.
     event_tx: broadcast::Sender<SessionEvent>,
     /// Session state.
@@ -154,12 +166,13 @@ impl Session {
 
         Self {
             session_id,
-            workspace_path,
+            workspace_path: RwLock::new(workspace_path),
             event_tx,
             state: Arc::new(RwLock::new(SessionState {
                 tools: HashMap::new(),
                 permission_handler: None,
                 user_input_handler: None,
+                elicitation_handler: None,
                 hooks: None,
                 event_handlers: HashMap::new(),
                 next_handler_id: AtomicU64::new(1),
@@ -181,8 +194,13 @@ impl Session {
     ///
     /// Contains checkpoints/, plan.md, and files/ subdirectories.
     /// Returns None if infinite sessions are disabled.
-    pub fn workspace_path(&self) -> Option<&str> {
-        self.workspace_path.as_deref()
+    pub async fn workspace_path(&self) -> Option<String> {
+        self.workspace_path.read().await.clone()
+    }
+
+    /// Set the workspace path (called after session.create/resume RPC completes).
+    pub async fn set_workspace_path(&self, path: String) {
+        *self.workspace_path.write().await = Some(path);
     }
 
     // =========================================================================
@@ -355,6 +373,9 @@ impl Session {
                 if let Some(rules) = &result.rules {
                     perm_result_inner["rules"] = serde_json::json!(rules);
                 }
+                if let Some(feedback) = &result.feedback {
+                    perm_result_inner["feedback"] = serde_json::json!(feedback);
+                }
                 let perm_result = serde_json::json!({
                     "sessionId": session_id,
                     "requestId": request_id,
@@ -437,6 +458,14 @@ impl Session {
             })?;
 
         Ok(events)
+    }
+
+    /// Get raw JSON messages from the session (for replay/debugging).
+    pub async fn get_messages_raw(&self) -> Result<serde_json::Value> {
+        let params = serde_json::json!({
+            "sessionId": self.session_id,
+        });
+        (self.invoke_fn)("session.getMessages", Some(params)).await
     }
 
     // =========================================================================
@@ -564,6 +593,24 @@ impl Session {
     pub async fn has_user_input_handler(&self) -> bool {
         let state = self.state.read().await;
         state.user_input_handler.is_some()
+    }
+
+    // =========================================================================
+    // Elicitation
+    // =========================================================================
+
+    /// Register an async handler for elicitation requests.
+    ///
+    /// The handler receives an `ElicitationRequest` and returns an
+    /// `ElicitationResponse` via an async future, enabling patterns like
+    /// oneshot channels for TUI-driven user input.
+    pub async fn register_elicitation_handler<F, Fut>(&self, handler: F)
+    where
+        F: Fn(ElicitationRequest) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ElicitationResponse> + Send + 'static,
+    {
+        let mut state = self.state.write().await;
+        state.elicitation_handler = Some(Arc::new(move |req| Box::pin(handler(req))));
     }
 
     // =========================================================================
@@ -1106,7 +1153,10 @@ mod tests {
             Some("/tmp/workspace".to_string()),
             mock_invoke,
         );
-        assert_eq!(session.workspace_path(), Some("/tmp/workspace"));
+        assert_eq!(
+            session.workspace_path().await.as_deref(),
+            Some("/tmp/workspace")
+        );
     }
 
     #[tokio::test]

@@ -199,6 +199,10 @@ pub struct PermissionRequestResult {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<serde_json::Value>>,
+    /// Optional user feedback when the permission is denied interactively.
+    /// Sent back to the model as part of the tool result so it can adapt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
 }
 
 impl PermissionRequestResult {
@@ -207,6 +211,7 @@ impl PermissionRequestResult {
         Self {
             kind: "approved".to_string(),
             rules: None,
+            feedback: None,
         }
     }
 
@@ -215,6 +220,19 @@ impl PermissionRequestResult {
         Self {
             kind: "denied-no-approval-rule-and-could-not-request-from-user".to_string(),
             rules: None,
+            feedback: None,
+        }
+    }
+
+    /// Create a "denied by user" result with optional feedback text.
+    ///
+    /// The feedback is included in the tool result sent to the model so it
+    /// can adjust its approach (e.g. "use a different file" or "skip this step").
+    pub fn denied_by_user(feedback: Option<String>) -> Self {
+        Self {
+            kind: "denied-interactively-by-user".to_string(),
+            rules: None,
+            feedback,
         }
     }
 
@@ -541,6 +559,11 @@ impl Tool {
         self
     }
 
+    /// Convenience: mark this tool as overriding a built-in tool with the same name.
+    pub fn overrides_built_in(self) -> Self {
+        self.overrides_built_in_tool(true)
+    }
+
     /// Skip permission checks for this tool.
     pub fn skip_permission(mut self, value: bool) -> Self {
         self.skip_permission = value;
@@ -827,6 +850,32 @@ impl std::fmt::Debug for SessionHooks {
 // Session Configuration
 // =============================================================================
 
+/// Callback registered before session creation/resume to receive early events.
+/// Wraps `Arc<dyn Fn>` so it can be stored in `#[derive(Clone)]` config structs.
+#[derive(Clone)]
+pub struct OnEventHandler(pub Arc<dyn Fn(&crate::events::SessionEvent) + Send + Sync>);
+
+impl OnEventHandler {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&crate::events::SessionEvent) + Send + Sync + 'static,
+    {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for OnEventHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnEventHandler(..)")
+    }
+}
+
+impl Default for OnEventHandler {
+    fn default() -> Self {
+        Self(Arc::new(|_| {}))
+    }
+}
+
 /// Configuration for creating a new session.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -888,11 +937,23 @@ pub struct SessionConfig {
     #[serde(skip)]
     pub hooks: Option<SessionHooks>,
 
+    /// Hook types advertised to the server so it sends `hooks.invoke` callbacks.
+    /// Automatically populated from `hooks` by `Client::create_session`.
+    /// E.g. `["preToolUse", "postToolUse", "sessionStart"]`.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "hooks")]
+    pub supported_hooks: Option<Vec<String>>,
+
     /// If true and provider/model not explicitly set, load from `COPILOT_SDK_BYOK_*` env vars.
     ///
     /// Default: false (explicit configuration preferred over environment variables)
     #[serde(skip)]
     pub auto_byok_from_env: bool,
+
+    /// Optional event handler registered before the session.create RPC is issued.
+    /// This guarantees that early events emitted by the CLI during session creation
+    /// (e.g. `session.start`) are delivered to the handler.
+    #[serde(skip)]
+    pub on_event: Option<OnEventHandler>,
 }
 
 /// Configuration for resuming an existing session.
@@ -903,6 +964,12 @@ pub struct ResumeSessionConfig {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<SystemMessageConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excluded_tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderConfig>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -949,6 +1016,10 @@ pub struct ResumeSessionConfig {
     /// Session hooks for pre/post tool use, session lifecycle, etc.
     #[serde(skip)]
     pub hooks: Option<SessionHooks>,
+
+    /// Hook types advertised to the server so it sends `hooks.invoke` callbacks.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "hooks")]
+    pub supported_hooks: Option<Vec<String>>,
 
     /// If true and provider not explicitly set, load from `COPILOT_SDK_BYOK_*` env vars.
     ///
@@ -1317,6 +1388,48 @@ pub struct UserInputResponse {
 #[serde(rename_all = "camelCase")]
 pub struct UserInputInvocation {
     pub session_id: String,
+}
+
+// =============================================================================
+// Elicitation Types (Loom extension)
+// =============================================================================
+
+/// Request for structured user input via elicitation.
+///
+/// Wraps the elicitation broadcast event data into a handler-friendly struct.
+#[derive(Debug, Clone)]
+pub struct ElicitationRequest {
+    pub request_id: String,
+    pub message: Option<String>,
+    pub requested_schema: Option<serde_json::Value>,
+}
+
+/// Response to an elicitation request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElicitationResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub dismissed: bool,
+}
+
+impl ElicitationResponse {
+    /// Create a response with user's answer.
+    pub fn answer(result: serde_json::Value) -> Self {
+        Self {
+            result: Some(result),
+            dismissed: false,
+        }
+    }
+
+    /// Dismiss the elicitation without answering.
+    pub fn dismiss() -> Self {
+        Self {
+            result: None,
+            dismissed: true,
+        }
+    }
 }
 
 // =============================================================================

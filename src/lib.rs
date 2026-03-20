@@ -36,6 +36,7 @@
 //! ```
 
 pub mod client;
+pub mod debug_log;
 pub mod error;
 pub mod events;
 pub mod jsonrpc;
@@ -152,6 +153,12 @@ pub use types::{
     SDK_PROTOCOL_VERSION,
 };
 
+pub use types::OnEventHandler;
+pub use types::{ElicitationRequest, ElicitationResponse};
+
+// Re-export session types
+pub use session::EventSubscription;
+
 // Re-export event types
 pub use events::{
     // Event data types
@@ -161,43 +168,63 @@ pub use events::{
     AssistantMessageDeltaData,
     AssistantReasoningData,
     AssistantReasoningDeltaData,
+    AssistantStreamingDeltaData,
     AssistantTurnEndData,
     AssistantTurnStartData,
     AssistantUsageData,
+    CommandCompletedData,
+    CommandQueuedData,
     CompactionTokensUsed,
     CustomAgentCompletedData,
     CustomAgentFailedData,
     CustomAgentSelectedData,
     CustomAgentStartedData,
+    ElicitationCompletedData,
+    ElicitationRequestedData,
+    ExitPlanModeCompletedData,
+    ExitPlanModeRequestedData,
+    ExternalToolCompletedData,
+    ExternalToolRequestedData,
     HandoffSourceType,
     HookEndData,
     HookError,
     HookStartData,
     PendingMessagesModifiedData,
+    PermissionCompletedData,
+    PermissionRequestedData,
     // Main event types
     RawSessionEvent,
     RepositoryInfo,
     SessionCompactionCompleteData,
     SessionCompactionStartData,
+    SessionContextChangedData,
     SessionErrorData,
     SessionEvent,
     SessionEventData,
     SessionHandoffData,
     SessionIdleData,
     SessionInfoData,
+    SessionModeChangedData,
     SessionModelChangeData,
+    SessionPlanChangedData,
     SessionResumeData,
     SessionShutdownData,
     SessionSnapshotRewindData,
     SessionStartData,
+    SessionTaskCompleteData,
+    SessionTitleChangedData,
     SessionTruncationData,
     SessionUsageInfoData,
+    SessionWarningData,
+    SessionWorkspaceFileChangedData,
     ShutdownCodeChanges,
     ShutdownType,
     SkillInvokedData,
+    SubagentDeselectedData,
     SystemMessageEventData,
     SystemMessageMetadata,
     SystemMessageRole,
+    SystemNotificationData,
     ToolExecutionCompleteData,
     ToolExecutionError,
     ToolExecutionPartialResultData,
@@ -206,6 +233,8 @@ pub use events::{
     ToolRequestItem,
     ToolResultContent,
     ToolUserRequestedData,
+    UserInputCompletedData,
+    UserInputRequestedData,
     UserMessageAttachmentItem,
     UserMessageData,
 };
@@ -226,8 +255,8 @@ pub use process::{
 
 // Re-export session types
 pub use session::{
-    EventHandler, EventSubscription, InvokeFuture, PermissionHandler, RegisteredTool, Session,
-    ToolHandler, UserInputHandler,
+    EventHandler, InvokeFuture, PermissionHandler, RegisteredTool, Session, ToolHandler,
+    UserInputHandler,
 };
 
 // Re-export client types
