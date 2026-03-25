@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 // =============================================================================
 // Helper Functions
@@ -128,6 +128,40 @@ fn spawn_cli_stderr_logger(stderr: tokio::process::ChildStderr) {
             tracing::debug!(target: "copilot_sdk::cli_stderr", "{line}");
         }
     });
+}
+
+enum OrderedNotification {
+    SessionEvent {
+        session_id: String,
+        event: SessionEvent,
+    },
+    SessionLifecycle(SessionLifecycleEvent),
+}
+
+fn spawn_ordered_notification_dispatcher(
+    sessions: Arc<RwLock<HashMap<String, Arc<Session>>>>,
+    lifecycle_handlers: Arc<RwLock<HashMap<u64, LifecycleHandler>>>,
+) -> mpsc::UnboundedSender<OrderedNotification> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<OrderedNotification>();
+    tokio::spawn(async move {
+        while let Some(notification) = rx.recv().await {
+            match notification {
+                OrderedNotification::SessionEvent { session_id, event } => {
+                    let session = sessions.read().await.get(&session_id).cloned();
+                    if let Some(session) = session {
+                        session.dispatch_event(event).await;
+                    }
+                }
+                OrderedNotification::SessionLifecycle(event) => {
+                    let handlers = lifecycle_handlers.read().await;
+                    for handler in handlers.values() {
+                        handler(&event);
+                    }
+                }
+            }
+        }
+    });
+    tx
 }
 
 /// Handler for client-level lifecycle events (session created, deleted, etc.).
@@ -1450,37 +1484,28 @@ impl Client {
         // Clone Arc references for the handlers
         let sessions = Arc::clone(&self.sessions);
         let lifecycle_handlers = Arc::clone(&self.lifecycle_handlers);
+        let notification_tx = spawn_ordered_notification_dispatcher(
+            Arc::clone(&sessions),
+            Arc::clone(&lifecycle_handlers),
+        );
 
         // Set up notification handler for session events and lifecycle events
         rpc.set_notification_handler(move |method, params| {
             if method == "session.event" {
-                let sessions = Arc::clone(&sessions);
-                let params = params.clone();
-
-                // Spawn a task to handle the event
-                tokio::spawn(async move {
-                    if let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) {
-                        if let Some(session) = sessions.read().await.get(session_id) {
-                            if let Some(event_data) = params.get("event") {
-                                if let Ok(event) = SessionEvent::from_json(event_data) {
-                                    session.dispatch_event(event).await;
-                                }
-                            }
+                if let Some(session_id) = params.get("sessionId").and_then(|v| v.as_str()) {
+                    if let Some(event_data) = params.get("event") {
+                        if let Ok(event) = SessionEvent::from_json(event_data) {
+                            let _ = notification_tx.send(OrderedNotification::SessionEvent {
+                                session_id: session_id.to_string(),
+                                event,
+                            });
                         }
                     }
-                });
+                }
             } else if method == "session.lifecycle" {
-                let lifecycle_handlers = Arc::clone(&lifecycle_handlers);
-                let params = params.clone();
-
-                tokio::spawn(async move {
-                    if let Ok(event) = serde_json::from_value::<SessionLifecycleEvent>(params) {
-                        let handlers = lifecycle_handlers.read().await;
-                        for handler in handlers.values() {
-                            handler(&event);
-                        }
-                    }
-                });
+                if let Ok(event) = serde_json::from_value::<SessionLifecycleEvent>(params.clone()) {
+                    let _ = notification_tx.send(OrderedNotification::SessionLifecycle(event));
+                }
             }
         })
         .await;
@@ -1766,6 +1791,7 @@ impl ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::SessionEventData;
 
     #[test]
     fn test_client_builder() {
@@ -1917,5 +1943,71 @@ mod tests {
             "arguments": "{not valid json"
         });
         assert_eq!(normalize_tool_arguments(&params), json!({}));
+    }
+
+    #[tokio::test]
+    async fn ordered_notification_dispatcher_preserves_session_event_order() {
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
+        let lifecycle_handlers = Arc::new(RwLock::new(HashMap::new()));
+        let session = Arc::new(Session::new("sess-1".into(), None, |_method, _params| {
+            Box::pin(async { Ok(Value::Null) })
+        }));
+        sessions
+            .write()
+            .await
+            .insert("sess-1".to_string(), Arc::clone(&session));
+
+        let tx = spawn_ordered_notification_dispatcher(
+            Arc::clone(&sessions),
+            Arc::clone(&lifecycle_handlers),
+        );
+        let mut sub = session.subscribe();
+
+        let event1 = SessionEvent::from_json(&json!({
+            "id": "evt-1",
+            "timestamp": "2024-01-15T10:30:00Z",
+            "parentId": null,
+            "type": "assistant.reasoning_delta",
+            "data": {
+                "reasoningId": "reason-1",
+                "deltaContent": "first"
+            }
+        }))
+        .expect("event1");
+        let event2 = SessionEvent::from_json(&json!({
+            "id": "evt-2",
+            "timestamp": "2024-01-15T10:30:01Z",
+            "parentId": "evt-1",
+            "type": "assistant.reasoning_delta",
+            "data": {
+                "reasoningId": "reason-1",
+                "deltaContent": "second"
+            }
+        }))
+        .expect("event2");
+
+        tx.send(OrderedNotification::SessionEvent {
+            session_id: "sess-1".to_string(),
+            event: event1,
+        })
+        .expect("send first");
+        tx.send(OrderedNotification::SessionEvent {
+            session_id: "sess-1".to_string(),
+            event: event2,
+        })
+        .expect("send second");
+
+        let received1 = sub.recv().await.expect("recv first");
+        let received2 = sub.recv().await.expect("recv second");
+        assert_eq!(received1.id, "evt-1");
+        assert_eq!(received2.id, "evt-2");
+        assert!(matches!(
+            received1.data,
+            SessionEventData::AssistantReasoningDelta(_)
+        ));
+        assert!(matches!(
+            received2.data,
+            SessionEventData::AssistantReasoningDelta(_)
+        ));
     }
 }
