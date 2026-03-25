@@ -401,12 +401,16 @@ impl Session {
     /// Returns the message ID.
     pub async fn send(&self, options: impl Into<MessageOptions>) -> Result<String> {
         let options = options.into();
-        let params = serde_json::json!({
+        let mut params = serde_json::json!({
             "sessionId": self.session_id,
             "prompt": options.prompt,
-            "attachments": options.attachments,
-            "mode": options.mode,
         });
+        if let Some(attachments) = &options.attachments {
+            params["attachments"] = serde_json::json!(attachments);
+        }
+        if let Some(mode) = &options.mode {
+            params["mode"] = serde_json::json!(mode);
+        }
 
         let result = (self.invoke_fn)("session.send", Some(params)).await?;
 
