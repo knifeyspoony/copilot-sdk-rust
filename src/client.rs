@@ -388,8 +388,39 @@ async fn handle_hooks_invoke(
         .unwrap_or("");
 
     let input = params.get("input").cloned().unwrap_or(Value::Null);
+    crate::sdk_dlog!(
+        "hooks.invoke request: session_id={} hook_type={} input={}",
+        session_id,
+        hook_type,
+        preview_json(&input)
+    );
 
-    session.handle_hooks_invoke(hook_type, &input).await
+    let result = session.handle_hooks_invoke(hook_type, &input).await;
+    match &result {
+        Ok(output) => crate::sdk_dlog!(
+            "hooks.invoke response: session_id={} hook_type={} output={}",
+            session_id,
+            hook_type,
+            preview_json(output)
+        ),
+        Err(err) => crate::sdk_dlog!(
+            "hooks.invoke error: session_id={} hook_type={} error={err:#}",
+            session_id,
+            hook_type
+        ),
+    }
+
+    result
+}
+
+fn preview_json(value: &Value) -> String {
+    const LIMIT: usize = 400;
+    let text = serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string());
+    if text.chars().count() <= LIMIT {
+        return text;
+    }
+    let preview: String = text.chars().take(LIMIT).collect();
+    format!("{preview}...")
 }
 
 fn parse_cli_url(url: &str) -> Result<(String, u16)> {
