@@ -3,12 +3,11 @@
 
 //! Core types for the Copilot SDK.
 
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-use crate::error::CopilotError;
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -46,6 +45,7 @@ pub enum ConnectionState {
 pub enum SystemMessageMode {
     Append,
     Replace,
+    Customize,
 }
 
 /// Attachment type for user messages.
@@ -55,6 +55,7 @@ pub enum AttachmentType {
     File,
     Directory,
     Selection,
+    Blob,
 }
 
 /// Log level for the CLI.
@@ -245,6 +246,23 @@ impl PermissionRequestResult {
     pub fn is_denied(&self) -> bool {
         self.kind.starts_with("denied")
     }
+
+    /// Create a "no-result" permission outcome.
+    ///
+    /// Used when there is no meaningful result to return (e.g. the request
+    /// was dropped or the handler could not produce a decision).
+    pub fn no_result() -> Self {
+        Self {
+            kind: "no-result".to_string(),
+            rules: None,
+            feedback: None,
+        }
+    }
+
+    /// Returns true if this is a "no-result" outcome.
+    pub fn is_no_result(&self) -> bool {
+        self.kind == "no-result"
+    }
 }
 
 // =============================================================================
@@ -257,6 +275,52 @@ impl PermissionRequestResult {
 pub struct SystemMessageConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<SystemMessageMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Section-level overrides used when `mode` is `Customize`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sections: Option<HashMap<String, SectionOverride>>,
+}
+
+// =============================================================================
+// Customize-mode Section Types
+// =============================================================================
+
+/// Well-known system prompt section identifiers for use with `SystemMessageMode::Customize`.
+pub mod section {
+    pub const IDENTITY: &str = "identity";
+    pub const TONE: &str = "tone";
+    pub const TOOL_EFFICIENCY: &str = "tool_efficiency";
+    pub const ENVIRONMENT_CONTEXT: &str = "environment_context";
+    pub const CODE_CHANGE_RULES: &str = "code_change_rules";
+    pub const GUIDELINES: &str = "guidelines";
+    pub const SAFETY: &str = "safety";
+    pub const TOOL_INSTRUCTIONS: &str = "tool_instructions";
+    pub const CUSTOM_INSTRUCTIONS: &str = "custom_instructions";
+    pub const LAST_INSTRUCTIONS: &str = "last_instructions";
+}
+
+/// Action to perform on a system prompt section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SectionOverrideAction {
+    Replace,
+    Remove,
+    Append,
+    Prepend,
+}
+
+/// Override specification for a single system prompt section.
+///
+/// Used with `SystemMessageMode::Customize` to perform fine-grained edits to
+/// individual sections of the SDK-managed system prompt.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionOverride {
+    /// The operation to perform on this section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<SectionOverrideAction>,
+    /// Content for the override.  Ignored when `action` is `Remove`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }
@@ -420,14 +484,56 @@ pub struct CustomAgentConfig {
 // Attachment Types
 // =============================================================================
 
-/// Attachment item for user messages.
+/// Attachment for a user message.
+///
+/// # Examples
+/// ```
+/// use copilot_sdk::UserMessageAttachment;
+/// let file = UserMessageAttachment::File {
+///     path: "/tmp/foo.rs".into(),
+///     display_name: Some("foo.rs".into()),
+/// };
+/// let blob = UserMessageAttachment::Blob {
+///     data: "aGVsbG8=".into(),
+///     mime_type: "text/plain".into(),
+///     display_name: Some("greeting.txt".into()),
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserMessageAttachment {
-    #[serde(rename = "type")]
-    pub attachment_type: AttachmentType,
-    pub path: String,
-    pub display_name: String,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum UserMessageAttachment {
+    /// A local file path.
+    File {
+        path: String,
+        #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    /// A local directory path.
+    Directory {
+        path: String,
+        #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    /// A text selection from a file.
+    Selection {
+        #[serde(rename = "filePath")]
+        file_path: String,
+        #[serde(rename = "displayName")]
+        display_name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selection: Option<SelectionRange>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Inline binary/text data.
+    Blob {
+        /// Base64-encoded (or raw text) content.
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
 }
 
 // =============================================================================
@@ -954,6 +1060,15 @@ pub struct SessionConfig {
     /// (e.g. `session.start`) are delivered to the handler.
     #[serde(skip)]
     pub on_event: Option<OnEventHandler>,
+
+    /// Slash command definitions.  Handlers are registered with the session;
+    /// only `name`/`description` pairs are sent to the CLI.
+    #[serde(skip)]
+    pub commands: Vec<CommandDefinition>,
+
+    /// Wire representation populated from `commands` by `Client::create_session`.
+    #[serde(rename = "commands", skip_serializing_if = "Vec::is_empty")]
+    pub wire_commands: Vec<WireCommand>,
 }
 
 /// Configuration for resuming an existing session.
@@ -1026,6 +1141,14 @@ pub struct ResumeSessionConfig {
     /// Default: false (explicit configuration preferred over environment variables)
     #[serde(skip)]
     pub auto_byok_from_env: bool,
+
+    /// Slash command definitions.
+    #[serde(skip)]
+    pub commands: Vec<CommandDefinition>,
+
+    /// Wire representation populated from `commands` by `Client::resume_session`.
+    #[serde(rename = "commands", skip_serializing_if = "Vec::is_empty")]
+    pub wire_commands: Vec<WireCommand>,
 }
 
 /// Options for sending a message.
@@ -1115,10 +1238,7 @@ pub struct ClientOptions {
     pub on_list_models: Option<
         Arc<
             dyn Fn() -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<Output = Result<Vec<ModelInfo>, CopilotError>>
-                            + Send,
-                    >,
+                    Box<dyn std::future::Future<Output = Result<Vec<ModelInfo>>> + Send>,
                 > + Send
                 + Sync,
         >,
@@ -1714,6 +1834,72 @@ pub struct TelemetryConfig {
     pub capture_content: Option<bool>,
 }
 
+// =============================================================================
+// Slash Command Types
+// =============================================================================
+
+/// Context passed to a slash command handler.
+#[derive(Debug, Clone)]
+pub struct CommandContext {
+    /// The session that received the command.
+    pub session_id: String,
+    /// The full command string as typed by the user (e.g. `/fix the bug`).
+    pub command: String,
+    /// The command name without the leading `/` (e.g. `fix`).
+    pub command_name: String,
+    /// Everything after the command name (may be empty).
+    pub args: String,
+}
+
+/// Async slash command handler.
+pub type CommandHandler = Arc<
+    dyn Fn(
+            CommandContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A slash command definition.
+///
+/// Register slash commands in [`SessionConfig::commands`] when creating a
+/// session. The CLI will route `/<name>` invocations to the `handler`.
+pub struct CommandDefinition {
+    /// Command name, without the leading `/`.
+    pub name: String,
+    /// Short description shown in the CLI help.
+    pub description: String,
+    /// Handler invoked when the command is triggered.
+    #[allow(dead_code)]
+    pub handler: CommandHandler,
+}
+
+impl Clone for CommandDefinition {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            handler: Arc::clone(&self.handler),
+        }
+    }
+}
+
+impl std::fmt::Debug for CommandDefinition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandDefinition")
+            .field("name", &self.name)
+            .field("description", &self.description)
+            .finish()
+    }
+}
+
+/// Wire representation of a command sent to the CLI (handler excluded).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireCommand {
+    pub name: String,
+    pub description: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2222,5 +2408,184 @@ mod tests {
         let value = serde_json::to_value(&config).unwrap();
         assert_eq!(value["clientName"], "my-cli");
         assert_eq!(value["agent"], "helper");
+    }
+
+    // =========================================================================
+    // Tests for new features (v0.2.1 parity)
+    // =========================================================================
+
+    #[test]
+    fn test_permission_no_result() {
+        let r = PermissionRequestResult::no_result();
+        assert_eq!(r.kind, "no-result");
+        assert!(r.is_no_result());
+        assert!(!r.is_approved());
+        assert!(!r.is_denied());
+
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["kind"], "no-result");
+    }
+
+    #[test]
+    fn test_attachment_type_blob() {
+        let j = serde_json::json!("blob");
+        let at: AttachmentType = serde_json::from_value(j).unwrap();
+        assert_eq!(at, AttachmentType::Blob);
+        let back = serde_json::to_value(at).unwrap();
+        assert_eq!(back, "blob");
+    }
+
+    #[test]
+    fn test_user_message_attachment_file() {
+        let att = UserMessageAttachment::File {
+            path: "/tmp/foo.rs".into(),
+            display_name: Some("foo.rs".into()),
+        };
+        let j = serde_json::to_value(&att).unwrap();
+        assert_eq!(j["type"], "file");
+        assert_eq!(j["path"], "/tmp/foo.rs");
+        assert_eq!(j["displayName"], "foo.rs");
+    }
+
+    #[test]
+    fn test_user_message_attachment_blob() {
+        let att = UserMessageAttachment::Blob {
+            data: "aGVsbG8=".into(),
+            mime_type: "text/plain".into(),
+            display_name: Some("greeting.txt".into()),
+        };
+        let j = serde_json::to_value(&att).unwrap();
+        assert_eq!(j["type"], "blob");
+        assert_eq!(j["data"], "aGVsbG8=");
+        assert_eq!(j["mimeType"], "text/plain");
+        assert_eq!(j["displayName"], "greeting.txt");
+
+        // Round-trip
+        let back: UserMessageAttachment = serde_json::from_value(j).unwrap();
+        if let UserMessageAttachment::Blob {
+            data,
+            mime_type,
+            display_name,
+        } = back
+        {
+            assert_eq!(data, "aGVsbG8=");
+            assert_eq!(mime_type, "text/plain");
+            assert_eq!(display_name, Some("greeting.txt".into()));
+        } else {
+            panic!("expected Blob variant");
+        }
+    }
+
+    #[test]
+    fn test_user_message_attachment_blob_no_display_name() {
+        let att = UserMessageAttachment::Blob {
+            data: "data".into(),
+            mime_type: "image/png".into(),
+            display_name: None,
+        };
+        let j = serde_json::to_value(&att).unwrap();
+        assert_eq!(j["type"], "blob");
+        assert!(j.get("displayName").is_none());
+    }
+
+    #[test]
+    fn test_user_message_attachment_directory() {
+        let att = UserMessageAttachment::Directory {
+            path: "/src".into(),
+            display_name: None,
+        };
+        let j = serde_json::to_value(&att).unwrap();
+        assert_eq!(j["type"], "directory");
+        assert_eq!(j["path"], "/src");
+        assert!(j.get("displayName").is_none());
+    }
+
+    #[test]
+    fn test_system_message_mode_customize() {
+        let mode = SystemMessageMode::Customize;
+        let j = serde_json::to_value(mode).unwrap();
+        assert_eq!(j, "customize");
+
+        let back: SystemMessageMode = serde_json::from_value(j).unwrap();
+        assert_eq!(back, SystemMessageMode::Customize);
+    }
+
+    #[test]
+    fn test_section_override_action_roundtrip() {
+        for (action, expected) in [
+            (SectionOverrideAction::Replace, "replace"),
+            (SectionOverrideAction::Remove, "remove"),
+            (SectionOverrideAction::Append, "append"),
+            (SectionOverrideAction::Prepend, "prepend"),
+        ] {
+            let j = serde_json::to_value(action).unwrap();
+            assert_eq!(j, expected);
+            let back: SectionOverrideAction = serde_json::from_value(j).unwrap();
+            assert_eq!(back, action);
+        }
+    }
+
+    #[test]
+    fn test_section_override_serialization() {
+        let ovr = SectionOverride {
+            action: Some(SectionOverrideAction::Append),
+            content: Some("extra context".into()),
+        };
+        let j = serde_json::to_value(&ovr).unwrap();
+        assert_eq!(j["action"], "append");
+        assert_eq!(j["content"], "extra context");
+    }
+
+    #[test]
+    fn test_system_message_config_with_sections() {
+        let mut sections = HashMap::new();
+        sections.insert(
+            section::TONE.to_string(),
+            SectionOverride {
+                action: Some(SectionOverrideAction::Replace),
+                content: Some("Be terse.".into()),
+            },
+        );
+        let cfg = SystemMessageConfig {
+            mode: Some(SystemMessageMode::Customize),
+            sections: Some(sections),
+            ..Default::default()
+        };
+        let j = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(j["mode"], "customize");
+        assert_eq!(j["sections"]["tone"]["action"], "replace");
+        assert_eq!(j["sections"]["tone"]["content"], "Be terse.");
+    }
+
+    #[test]
+    fn test_wire_command_serialization() {
+        let wc = WireCommand {
+            name: "fix".into(),
+            description: "Fix the code".into(),
+        };
+        let j = serde_json::to_value(&wc).unwrap();
+        assert_eq!(j["name"], "fix");
+        assert_eq!(j["description"], "Fix the code");
+    }
+
+    #[test]
+    fn test_session_config_with_wire_commands() {
+        let config = SessionConfig {
+            wire_commands: vec![WireCommand {
+                name: "help".into(),
+                description: "Show help".into(),
+            }],
+            ..Default::default()
+        };
+        let j = serde_json::to_value(&config).unwrap();
+        assert_eq!(j["commands"][0]["name"], "help");
+        assert_eq!(j["commands"][0]["description"], "Show help");
+    }
+
+    #[test]
+    fn test_session_config_empty_commands_not_serialized() {
+        let config = SessionConfig::default();
+        let j = serde_json::to_value(&config).unwrap();
+        assert!(j.get("commands").is_none());
     }
 }

@@ -790,6 +790,18 @@ impl Client {
         let on_event = config.on_event.take();
         let hooks = config.hooks.take();
 
+        // Extract command definitions and populate wire representation
+        let commands = std::mem::take(&mut config.commands);
+        if !commands.is_empty() {
+            config.wire_commands = commands
+                .iter()
+                .map(|c| crate::types::WireCommand {
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect();
+        }
+
         // Build the request
         let params = serde_json::to_value(&config)?;
 
@@ -807,6 +819,13 @@ impl Client {
             if hooks.has_any() {
                 session.register_hooks(hooks).await;
             }
+        }
+
+        // Register command handlers
+        if !commands.is_empty() {
+            session
+                .register_command_handlers(commands.into_iter().map(|c| (c.name, c.handler)))
+                .await;
         }
 
         // Store session before the RPC
@@ -861,6 +880,19 @@ impl Client {
 
         let on_event = config.on_event.take();
         let hooks = config.hooks.take();
+
+        // Extract command definitions and populate wire representation
+        let commands = std::mem::take(&mut config.commands);
+        if !commands.is_empty() {
+            config.wire_commands = commands
+                .iter()
+                .map(|c| crate::types::WireCommand {
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect();
+        }
+
         let params = serde_json::to_value(&config)?;
 
         let session = self.create_session_object(session_id.clone(), None).await;
@@ -875,6 +907,11 @@ impl Client {
             if hooks.has_any() {
                 session.register_hooks(hooks).await;
             }
+        }
+        if !commands.is_empty() {
+            session
+                .register_command_handlers(commands.into_iter().map(|c| (c.name, c.handler)))
+                .await;
         }
 
         self.sessions
@@ -914,6 +951,19 @@ impl Client {
         }
 
         let hooks = config.hooks.take();
+
+        // Extract command definitions and populate wire representation
+        let commands = std::mem::take(&mut config.commands);
+        if !commands.is_empty() {
+            config.wire_commands = commands
+                .iter()
+                .map(|c| crate::types::WireCommand {
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect();
+        }
+
         let mut params = serde_json::to_value(&config)?;
         params["sessionId"] = json!(session_id);
 
@@ -926,6 +976,11 @@ impl Client {
             if hooks.has_any() {
                 session.register_hooks(hooks).await;
             }
+        }
+        if !commands.is_empty() {
+            session
+                .register_command_handlers(commands.into_iter().map(|c| (c.name, c.handler)))
+                .await;
         }
 
         self.sessions
@@ -968,6 +1023,19 @@ impl Client {
         }
 
         let hooks = config.hooks.take();
+
+        // Extract command definitions and populate wire representation
+        let commands = std::mem::take(&mut config.commands);
+        if !commands.is_empty() {
+            config.wire_commands = commands
+                .iter()
+                .map(|c| crate::types::WireCommand {
+                    name: c.name.clone(),
+                    description: c.description.clone(),
+                })
+                .collect();
+        }
+
         let mut params = serde_json::to_value(&config)?;
         params["sessionId"] = json!(session_id);
 
@@ -982,6 +1050,11 @@ impl Client {
             if hooks.has_any() {
                 session.register_hooks(hooks).await;
             }
+        }
+        if !commands.is_empty() {
+            session
+                .register_command_handlers(commands.into_iter().map(|c| (c.name, c.handler)))
+                .await;
         }
 
         self.sessions
@@ -1020,6 +1093,22 @@ impl Client {
             .unwrap_or_default();
 
         Ok(sessions)
+    }
+
+    /// Get metadata for a specific session by ID.
+    ///
+    /// Returns `Ok(None)` if the session does not exist.
+    pub async fn get_session_metadata(&self, session_id: &str) -> Result<Option<SessionMetadata>> {
+        self.ensure_connected().await?;
+
+        let params = json!({ "sessionId": session_id });
+        let result = self.invoke("session.getMetadata", Some(params)).await?;
+
+        let metadata: Option<SessionMetadata> = result
+            .get("session")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        Ok(metadata)
     }
 
     /// Delete a session.

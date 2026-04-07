@@ -34,6 +34,7 @@ async fn main() -> copilot_sdk::Result<()> {
                      When using tools, proceed without hesitation."
                         .to_string(),
                 ),
+                ..Default::default()
             }),
             ..Default::default()
         })

@@ -3,9 +3,7 @@
 
 //! Attachments example demonstrating file and directory attachments.
 
-use copilot_sdk::{
-    AttachmentType, Client, MessageOptions, SessionConfig, SessionEventData, UserMessageAttachment,
-};
+use copilot_sdk::{Client, MessageOptions, SessionConfig, SessionEventData, UserMessageAttachment};
 use std::fs;
 use std::io::{self, Write};
 
@@ -36,10 +34,9 @@ fn divide(a: i32, b: i32) -> i32 {
     // Send with file attachment
     let opts = MessageOptions {
         prompt: "Review this code for bugs.".to_string(),
-        attachments: Some(vec![UserMessageAttachment {
-            attachment_type: AttachmentType::File,
+        attachments: Some(vec![UserMessageAttachment::File {
             path: sample_file.to_string_lossy().to_string(),
-            display_name: "sample.rs".to_string(),
+            display_name: Some("sample.rs".to_string()),
         }]),
         mode: None,
     };

@@ -60,6 +60,10 @@ pub use types::{
     AttachmentType,
     AzureOptions,
     ClientOptions,
+    // Command types
+    CommandContext,
+    CommandDefinition,
+    CommandHandler,
     ConnectionState,
     CustomAgentConfig,
     // Hook types
@@ -102,6 +106,9 @@ pub use types::{
     QuotaResult,
     QuotaSnapshot,
     ResumeSessionConfig,
+    // Section override types
+    SectionOverride,
+    SectionOverrideAction,
     // Selection types
     SelectionAttachment,
     SelectionPosition,
@@ -147,12 +154,15 @@ pub use types::{
     UserPromptSubmittedHandler,
     UserPromptSubmittedHookInput,
     UserPromptSubmittedHookOutput,
+    // Wire command type
+    WireCommand,
     // Workspace types
     WorkspaceFile,
     // Constants
     SDK_PROTOCOL_VERSION,
 };
 
+pub use types::section;
 pub use types::OnEventHandler;
 pub use types::{ElicitationRequest, ElicitationResponse};
 
@@ -173,6 +183,7 @@ pub use events::{
     AssistantTurnStartData,
     AssistantUsageData,
     CommandCompletedData,
+    CommandExecuteData,
     CommandQueuedData,
     CompactionTokensUsed,
     CustomAgentCompletedData,

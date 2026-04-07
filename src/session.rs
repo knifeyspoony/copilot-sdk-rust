@@ -8,12 +8,13 @@
 use crate::error::{CopilotError, Result};
 use crate::events::{SessionEvent, SessionEventData};
 use crate::types::{
-    AgentInfo, ElicitationRequest, ElicitationResponse, ErrorOccurredHookInput, FleetStartOptions,
-    LogOptions, LogResult, MessageOptions, PermissionRequest, PermissionRequestResult, PlanData,
-    PostToolUseHookInput, PreToolUseHookInput, SessionEndHookInput, SessionHooks, SessionMode,
-    SessionStartHookInput, SetModelOptions, ShellExecOptions, ShellExecResult, ShellSignal, Tool,
-    ToolResultObject, UserInputInvocation, UserInputRequest, UserInputResponse,
-    UserPromptSubmittedHookInput, WorkspaceFile,
+    AgentInfo, CommandContext, CommandHandler, ElicitationRequest, ElicitationResponse,
+    ErrorOccurredHookInput, FleetStartOptions, LogOptions, LogResult, MessageOptions,
+    PermissionRequest, PermissionRequestResult, PlanData, PostToolUseHookInput,
+    PreToolUseHookInput, SessionEndHookInput, SessionHooks, SessionMode, SessionStartHookInput,
+    SetModelOptions, ShellExecOptions, ShellExecResult, ShellSignal, Tool, ToolResultObject,
+    UserInputInvocation, UserInputRequest, UserInputResponse, UserPromptSubmittedHookInput,
+    WorkspaceFile,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -106,6 +107,8 @@ struct SessionState {
     event_handlers: HashMap<u64, EventHandler>,
     /// Next handler ID.
     next_handler_id: AtomicU64,
+    /// Registered slash command handlers.
+    command_handlers: HashMap<String, CommandHandler>,
 }
 
 /// A Copilot conversation session.
@@ -176,6 +179,7 @@ impl Session {
                 hooks: None,
                 event_handlers: HashMap::new(),
                 next_handler_id: AtomicU64::new(1),
+                command_handlers: HashMap::new(),
             })),
             invoke_fn: Arc::new(invoke_fn),
         }
@@ -388,12 +392,52 @@ impl Session {
                 )
                 .await;
             }
+            SessionEventData::CommandExecute(data) => {
+                self.handle_command_execute(data).await;
+            }
             _ => {} // Not a broadcast request event
         }
     }
 
-    // =========================================================================
-    // Messaging
+    async fn handle_command_execute(&self, data: &crate::events::CommandExecuteData) {
+        let handler = {
+            let state = self.state.read().await;
+            state.command_handlers.get(&data.command_name).cloned()
+        };
+
+        let session_id = self.session_id.clone();
+        let request_id = data.request_id.clone();
+
+        let result = if let Some(handler) = handler {
+            let ctx = CommandContext {
+                session_id: session_id.clone(),
+                command: data.command.clone(),
+                command_name: data.command_name.clone(),
+                args: data.args.clone(),
+            };
+            handler(ctx).await
+        } else {
+            Err(CopilotError::Protocol(format!(
+                "no handler for command /{}",
+                data.command_name
+            )))
+        };
+
+        let params = match result {
+            Ok(()) => serde_json::json!({
+                "sessionId": session_id,
+                "requestId": request_id,
+            }),
+            Err(e) => serde_json::json!({
+                "sessionId": session_id,
+                "requestId": request_id,
+                "error": e.to_string(),
+            }),
+        };
+
+        let _ = (self.invoke_fn)("session.commands.handlePendingCommand", Some(params)).await;
+    }
+
     // =========================================================================
 
     /// Send a message to the session.
@@ -625,6 +669,20 @@ impl Session {
     pub async fn register_hooks(&self, hooks: SessionHooks) {
         let mut state = self.state.write().await;
         state.hooks = Some(hooks);
+    }
+
+    /// Register slash command handlers.
+    ///
+    /// Each `(name, handler)` pair is stored so that `command.execute` events
+    /// with the matching `commandName` are dispatched to the handler.
+    pub async fn register_command_handlers(
+        &self,
+        handlers: impl IntoIterator<Item = (String, CommandHandler)>,
+    ) {
+        let mut state = self.state.write().await;
+        for (name, handler) in handlers {
+            state.command_handlers.insert(name, handler);
+        }
     }
 
     /// Check if any hooks are registered.
@@ -1558,5 +1616,95 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_null());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_command_execute_calls_handler() {
+        use crate::types::{CommandContext, CommandHandler};
+
+        let rpc_calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let rpc_calls_for_invoke = Arc::clone(&rpc_calls);
+        let session = Session::new("sess-1".to_string(), None, move |method, params| {
+            let method = method.to_string();
+            let params = params.unwrap_or(Value::Null);
+            let rpc_calls = Arc::clone(&rpc_calls_for_invoke);
+            Box::pin(async move {
+                rpc_calls.lock().unwrap().push((method, params));
+                Ok(serde_json::json!({}))
+            })
+        });
+
+        // Register a "fix" command handler
+        let handler_called = Arc::new(std::sync::Mutex::new(false));
+        let handler_called_inner = Arc::clone(&handler_called);
+        let handler: CommandHandler = Arc::new(move |ctx: CommandContext| {
+            assert_eq!(ctx.command_name, "fix");
+            assert_eq!(ctx.args, "the bug");
+            *handler_called_inner.lock().unwrap() = true;
+            Box::pin(async { Ok(()) })
+        });
+        session
+            .register_command_handlers([("fix".to_string(), handler)])
+            .await;
+
+        let event = SessionEvent::from_json(&serde_json::json!({
+            "id": "evt-cmd",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "type": "command.execute",
+            "data": {
+                "requestId": "req-cmd-1",
+                "command": "/fix the bug",
+                "commandName": "fix",
+                "args": "the bug"
+            }
+        }))
+        .unwrap();
+
+        session.dispatch_event(event).await;
+
+        // Handler was invoked
+        assert!(*handler_called.lock().unwrap());
+
+        // RPC was called with the right method and no error
+        let calls = rpc_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "session.commands.handlePendingCommand");
+        assert_eq!(calls[0].1["requestId"], "req-cmd-1");
+        assert!(calls[0].1.get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_command_execute_unknown_command_sends_error() {
+        let rpc_calls = Arc::new(std::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let rpc_calls_for_invoke = Arc::clone(&rpc_calls);
+        let session = Session::new("sess-2".to_string(), None, move |method, params| {
+            let method = method.to_string();
+            let params = params.unwrap_or(Value::Null);
+            let rpc_calls = Arc::clone(&rpc_calls_for_invoke);
+            Box::pin(async move {
+                rpc_calls.lock().unwrap().push((method, params));
+                Ok(serde_json::json!({}))
+            })
+        });
+
+        let event = SessionEvent::from_json(&serde_json::json!({
+            "id": "evt-cmd2",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "type": "command.execute",
+            "data": {
+                "requestId": "req-cmd-2",
+                "command": "/unknown",
+                "commandName": "unknown",
+                "args": ""
+            }
+        }))
+        .unwrap();
+
+        session.dispatch_event(event).await;
+
+        let calls = rpc_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "session.commands.handlePendingCommand");
+        assert!(calls[0].1.get("error").is_some());
     }
 }

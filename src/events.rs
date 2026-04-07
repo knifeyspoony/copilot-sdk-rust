@@ -45,8 +45,16 @@ pub struct RepositoryInfo {
 pub struct UserMessageAttachmentItem {
     #[serde(rename = "type")]
     pub attachment_type: super::AttachmentType,
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
     pub display_name: String,
+    /// Inline data for blob attachments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// MIME type for blob attachments.
+    #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 /// Tool request in assistant message.
@@ -691,6 +699,19 @@ pub struct CommandCompletedData {
     pub result: Option<serde_json::Value>,
 }
 
+/// Data for `command.execute` event (slash command invocation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandExecuteData {
+    pub request_id: String,
+    /// The full command string including the `/` prefix.
+    pub command: String,
+    /// Command name without the leading `/`.
+    pub command_name: String,
+    /// Everything after the command name (may be empty).
+    pub args: String,
+}
+
 /// Data for `elicitation.requested` event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -834,6 +855,8 @@ pub enum SessionEventData {
     PermissionCompleted(PermissionCompletedData),
     CommandQueued(CommandQueuedData),
     CommandCompleted(CommandCompletedData),
+    /// Slash command execute request.
+    CommandExecute(CommandExecuteData),
     ElicitationRequested(ElicitationRequestedData),
     ElicitationCompleted(ElicitationCompletedData),
     ExitPlanModeRequested(ExitPlanModeRequestedData),
@@ -1135,6 +1158,9 @@ fn parse_event_data(event_type: &str, data: serde_json::Value) -> SessionEventDa
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         "command.completed" => serde_json::from_value(data)
             .map(SessionEventData::CommandCompleted)
+            .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
+        "command.execute" => serde_json::from_value(data)
+            .map(SessionEventData::CommandExecute)
             .unwrap_or_else(|_| SessionEventData::Unknown(serde_json::Value::Null)),
         "elicitation.requested" => serde_json::from_value(data)
             .map(SessionEventData::ElicitationRequested)
@@ -1712,5 +1738,30 @@ mod tests {
 
         let event = SessionEvent::from_json(&json).unwrap();
         assert_eq!(event.event_type, "session.usage_info");
+    }
+
+    #[test]
+    fn test_command_execute_event_deserialization() {
+        let json = json!({
+            "id": "evt_cmd",
+            "timestamp": "2025-01-01T00:00:00Z",
+            "type": "command.execute",
+            "data": {
+                "requestId": "req-1",
+                "command": "/fix the bug",
+                "commandName": "fix",
+                "args": "the bug"
+            }
+        });
+        let event = SessionEvent::from_json(&json).unwrap();
+        assert_eq!(event.event_type, "command.execute");
+        if let SessionEventData::CommandExecute(d) = &event.data {
+            assert_eq!(d.request_id, "req-1");
+            assert_eq!(d.command, "/fix the bug");
+            assert_eq!(d.command_name, "fix");
+            assert_eq!(d.args, "the bug");
+        } else {
+            panic!("expected CommandExecute variant");
+        }
     }
 }
