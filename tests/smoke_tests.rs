@@ -14,14 +14,18 @@
 //! 7. **Subagent tool scoping** – each subagent only sees its own tools.
 //! 8. **Agent management** – list / select / deselect lifecycle.
 //! 9. **Multi-tool streaming** – multiple tools + streaming deltas.
+//! 10. **Parent with MCP tool** – session-level MCP server.
+//! 11. **Parent MCP + subagent custom tool only** – subagent sees subset of tools.
+//! 12. **Subagent with own MCP server** – subagent brings MCP the parent lacks.
 //!
 //! Run with: `cargo test --features e2e --test smoke_tests -- --test-threads=1`
 
 #![cfg(feature = "e2e")]
 
 use copilot_sdk::{
-    find_copilot_cli, Client, CustomAgentConfig, LogLevel, PermissionRequestResult, SessionConfig,
-    SessionEventData, SystemMessageConfig, SystemMessageMode, Tool, ToolResultObject,
+    find_copilot_cli, Client, CustomAgentConfig, LogLevel, McpLocalServerConfig,
+    PermissionRequestResult, SessionConfig, SessionEventData, SystemMessageConfig,
+    SystemMessageMode, Tool, ToolResultObject,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
@@ -1274,6 +1278,336 @@ async fn smoke_agent_multi_tool_streaming() {
     assert!(
         content.contains("104"),
         "Response should contain 8*13=104: {content}"
+    );
+
+    session.destroy().await.ok();
+    client.stop().await;
+}
+
+// =============================================================================
+// MCP Helpers
+// =============================================================================
+
+/// Path to the test MCP echo server script.
+fn mcp_echo_server_path() -> String {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mcp_echo_server.js");
+    assert!(p.exists(), "MCP echo server not found at {:?}", p);
+    p.to_string_lossy().to_string()
+}
+
+/// Build an `McpLocalServerConfig` JSON value for the echo server.
+fn echo_mcp_config(tool_name: &str, server_name: &str) -> serde_json::Value {
+    let config = McpLocalServerConfig {
+        tools: vec!["*".to_string()],
+        command: "node".to_string(),
+        args: vec![mcp_echo_server_path()],
+        server_type: Some("local".to_string()),
+        timeout: Some(30000),
+        env: Some(
+            [
+                ("MCP_TOOL_NAME".to_string(), tool_name.to_string()),
+                ("MCP_SERVER_NAME".to_string(), server_name.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        cwd: None,
+    };
+    serde_json::to_value(&config).expect("serialize MCP config")
+}
+
+// =============================================================================
+// 10. Parent agent with MCP tool
+// =============================================================================
+
+/// Smoke test: configure a session-level MCP server, ask the model to use it,
+/// and verify the MCP tool is invoked and its result appears in the response.
+#[tokio::test]
+async fn smoke_parent_with_mcp_tool() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("client start");
+
+    let mut mcp_servers = std::collections::HashMap::new();
+    mcp_servers.insert(
+        "test-echo".to_string(),
+        echo_mcp_config("echo", "test-echo"),
+    );
+
+    let config = SessionConfig {
+        mcp_servers: Some(mcp_servers),
+        system_message: Some(SystemMessageConfig {
+            mode: Some(SystemMessageMode::Replace),
+            content: Some(
+                "You have an MCP tool called test-echo__echo. When the user asks you to \
+                 echo something, call it with the message. Report the exact tool result."
+                    .to_string(),
+            ),
+            ..Default::default()
+        }),
+        ..byok_session_config()
+    };
+
+    let session = client.create_session(config).await.expect("create session");
+
+    session
+        .register_permission_handler(|_req| PermissionRequestResult::approved())
+        .await;
+
+    let mut events = session.subscribe();
+    let event_log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let event_log_clone = Arc::clone(&event_log);
+
+    session
+        .send("Echo the message 'hello_mcp_42' using the echo tool")
+        .await
+        .expect("send");
+
+    let mut content = String::new();
+    let result = tokio::time::timeout(LLM_TIMEOUT, async {
+        while let Ok(event) = events.recv().await {
+            match &event.data {
+                SessionEventData::ToolExecutionStart(t) => {
+                    eprintln!("[smoke_parent_mcp] tool start: {}", t.tool_name);
+                    event_log_clone.lock().await.push(format!("tool_start:{}", t.tool_name));
+                }
+                SessionEventData::ToolExecutionComplete(t) => {
+                    eprintln!("[smoke_parent_mcp] tool complete: {} success={}", t.tool_call_id, t.success);
+                    event_log_clone.lock().await.push(format!("tool_complete:{}", t.success));
+                }
+                SessionEventData::AssistantMessage(msg) => content.push_str(&msg.content),
+                SessionEventData::AssistantMessageDelta(delta) => content.push_str(&delta.delta_content),
+                SessionEventData::SessionIdle(_) => break,
+                SessionEventData::SessionError(err) => {
+                    eprintln!("[smoke_parent_mcp] session error: {}", err.message);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(result.is_ok(), "Timed out");
+
+    let log = event_log.lock().await;
+    eprintln!("[smoke_parent_mcp] event log: {:?}", *log);
+    eprintln!("[smoke_parent_mcp] response: {content}");
+
+    // MCP tool should have been called
+    assert!(
+        log.iter().any(|e| e.contains("echo")),
+        "Should see MCP echo tool in events. Log: {:?}",
+        *log
+    );
+
+    // Response should contain the echoed message
+    assert!(
+        content.contains("hello_mcp_42"),
+        "Response should contain echoed message 'hello_mcp_42': {content}"
+    );
+
+    session.destroy().await.ok();
+    client.stop().await;
+}
+
+// =============================================================================
+// 11. Parent with MCP + custom tools, subagent sees only subset
+// =============================================================================
+
+/// Smoke test: parent session has both an MCP tool and a custom tool.
+/// Subagent is configured with `tools:` that restricts to only the custom tool.
+/// Verify the subagent can use its allowed tool but the MCP tool isn't called.
+#[tokio::test]
+async fn smoke_parent_mcp_subagent_custom_tool_only() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("client start");
+
+    let custom_tool_called = Arc::new(AtomicBool::new(false));
+    let custom_tool_called_clone = Arc::clone(&custom_tool_called);
+
+    let custom_tool = Tool::new("get_color")
+        .description("Returns the hex color code for a named color. Call this for color lookups.")
+        .schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Color name" }
+            },
+            "required": ["name"]
+        }));
+
+    let mut mcp_servers = std::collections::HashMap::new();
+    mcp_servers.insert(
+        "test-echo".to_string(),
+        echo_mcp_config("echo", "test-echo"),
+    );
+
+    // Subagent only gets the custom tool, NOT the MCP tool
+    let color_agent = CustomAgentConfig {
+        name: "color-agent".to_string(),
+        prompt: "You are a color specialist. Use the get_color tool to look up colors. \
+                 Report the exact result."
+            .to_string(),
+        display_name: Some("Color Agent".to_string()),
+        description: Some("Looks up color codes".to_string()),
+        tools: Some(vec!["get_color".to_string()]),
+        mcp_servers: None,
+        infer: Some(false),
+    };
+
+    let config = SessionConfig {
+        tools: vec![custom_tool.clone()],
+        mcp_servers: Some(mcp_servers),
+        custom_agents: Some(vec![color_agent]),
+        ..byok_session_config()
+    };
+
+    let session = client.create_session(config).await.expect("create session");
+
+    session
+        .register_tool_with_handler(
+            custom_tool,
+            Some(Arc::new(move |_name, args| {
+                custom_tool_called_clone.store(true, Ordering::SeqCst);
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                eprintln!("[smoke_mcp_subset] get_color called for: {name}");
+                ToolResultObject::text(format!("{name} is #FF5733"))
+            })),
+        )
+        .await;
+
+    session
+        .register_permission_handler(|_req| PermissionRequestResult::approved())
+        .await;
+
+    // Select the subagent — it should only have get_color, not echo
+    session.select_agent("color-agent").await.expect("select color-agent");
+
+    let response = tokio::time::timeout(
+        LLM_TIMEOUT,
+        session.send_and_collect("What is the hex code for coral?", None),
+    )
+    .await
+    .expect("timeout")
+    .expect("send_and_collect");
+
+    eprintln!("[smoke_mcp_subset] response: {response}");
+
+    assert!(
+        custom_tool_called.load(Ordering::SeqCst),
+        "Custom tool get_color should have been called by the subagent"
+    );
+    assert!(
+        response.contains("FF5733"),
+        "Response should contain color '#FF5733': {response}"
+    );
+
+    session.destroy().await.ok();
+    client.stop().await;
+}
+
+// =============================================================================
+// 12. Subagent with its own MCP server (not on parent)
+// =============================================================================
+
+/// Smoke test: subagent has an MCP server in its `mcp_servers` config that the
+/// parent session does NOT have. This verifies the CLI launches independent MCP
+/// servers per subagent — the subagent can bring its own tooling.
+#[tokio::test]
+async fn smoke_subagent_own_mcp_server() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("client start");
+
+    // Parent has NO MCP servers.
+    // Subagent brings its own.
+    let agent_with_mcp = CustomAgentConfig {
+        name: "echo-agent".to_string(),
+        prompt: "You are an echo agent. When asked to echo something, use the \
+                 agent-echo__echo tool. Report the exact tool result."
+            .to_string(),
+        display_name: Some("Echo Agent".to_string()),
+        description: Some("Echoes messages using its own MCP server".to_string()),
+        tools: None, // all tools (including its MCP tools)
+        mcp_servers: Some(
+            [(
+                "agent-echo".to_string(),
+                echo_mcp_config("echo", "agent-echo"),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+        infer: Some(false),
+    };
+
+    let config = SessionConfig {
+        // Parent has NO mcp_servers
+        custom_agents: Some(vec![agent_with_mcp]),
+        ..byok_session_config()
+    };
+
+    let session = client.create_session(config).await.expect("create session");
+
+    session
+        .register_permission_handler(|_req| PermissionRequestResult::approved())
+        .await;
+
+    // Select the subagent that has its own MCP server
+    session.select_agent("echo-agent").await.expect("select echo-agent");
+
+    let mut events = session.subscribe();
+    let event_log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+    let event_log_clone = Arc::clone(&event_log);
+
+    session
+        .send("Echo the message 'subagent_mcp_works' using the echo tool")
+        .await
+        .expect("send");
+
+    let mut content = String::new();
+    let result = tokio::time::timeout(LLM_TIMEOUT, async {
+        while let Ok(event) = events.recv().await {
+            match &event.data {
+                SessionEventData::ToolExecutionStart(t) => {
+                    eprintln!("[smoke_subagent_mcp] tool start: {}", t.tool_name);
+                    event_log_clone.lock().await.push(format!("tool_start:{}", t.tool_name));
+                }
+                SessionEventData::ToolExecutionComplete(t) => {
+                    eprintln!("[smoke_subagent_mcp] tool complete: {} success={}", t.tool_call_id, t.success);
+                    event_log_clone.lock().await.push(format!("tool_complete:{}", t.success));
+                }
+                SessionEventData::AssistantMessage(msg) => content.push_str(&msg.content),
+                SessionEventData::AssistantMessageDelta(delta) => content.push_str(&delta.delta_content),
+                SessionEventData::SessionIdle(_) => break,
+                SessionEventData::SessionError(err) => {
+                    eprintln!("[smoke_subagent_mcp] session error: {}", err.message);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(result.is_ok(), "Timed out");
+
+    let log = event_log.lock().await;
+    eprintln!("[smoke_subagent_mcp] event log: {:?}", *log);
+    eprintln!("[smoke_subagent_mcp] response: {content}");
+
+    // The subagent's MCP tool should have been called
+    assert!(
+        log.iter().any(|e| e.contains("echo")),
+        "Should see the subagent's MCP echo tool in events. Log: {:?}",
+        *log
+    );
+
+    // Response should contain the echoed message from the subagent's MCP server
+    assert!(
+        content.contains("subagent_mcp_works"),
+        "Response should contain 'subagent_mcp_works': {content}"
     );
 
     session.destroy().await.ok();
