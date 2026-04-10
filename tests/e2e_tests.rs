@@ -1304,6 +1304,7 @@ async fn test_custom_agent_config_on_create() {
         tools: None,
         mcp_servers: None,
         infer: Some(true),
+        ..Default::default()
     };
 
     let config = SessionConfig {

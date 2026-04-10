@@ -293,9 +293,10 @@ async fn smoke_agent_with_skill() {
 
     // Create a temp dir with a minimal skill definition
     let skill_dir = tempfile::tempdir().expect("tempdir");
-    let skill_file = skill_dir.path().join("math-helper.md");
+    let skill_subdir = skill_dir.path().join("math-helper");
+    std::fs::create_dir(&skill_subdir).expect("create skill subdir");
     std::fs::write(
-        &skill_file,
+        skill_subdir.join("SKILL.md"),
         r#"---
 name: math-helper
 description: A skill that helps with math problems
@@ -399,6 +400,7 @@ async fn smoke_agent_with_subagent() {
         tools: None,
         mcp_servers: None,
         infer: Some(true),
+        ..Default::default()
     };
 
     let config = SessionConfig {
@@ -541,6 +543,7 @@ async fn smoke_subagent_with_custom_tool() {
         tools: Some(vec!["get_fruit_price".to_string()]),
         mcp_servers: None,
         infer: Some(false), // inference OFF — we'll select explicitly
+        ..Default::default()
     };
 
     let config = SessionConfig {
@@ -738,6 +741,7 @@ async fn smoke_subagent_selected_with_custom_tool() {
         tools: Some(vec!["get_fruit_price".to_string()]),
         mcp_servers: None,
         infer: Some(false), // No inference — we select explicitly
+        ..Default::default()
     };
 
     let config = SessionConfig {
@@ -943,6 +947,7 @@ async fn smoke_subagent_tool_scoping() {
         tools: Some(vec!["get_fruit_price".to_string()]),
         mcp_servers: None,
         infer: Some(false),
+        ..Default::default()
     };
 
     let veggie_agent = CustomAgentConfig {
@@ -955,6 +960,7 @@ async fn smoke_subagent_tool_scoping() {
         tools: Some(vec!["get_veggie_price".to_string()]),
         mcp_servers: None,
         infer: Some(false),
+        ..Default::default()
     };
 
     let config = SessionConfig {
@@ -1073,6 +1079,7 @@ async fn smoke_agent_management_lifecycle() {
         tools: None,
         mcp_servers: None,
         infer: Some(false),
+        ..Default::default()
     };
 
     let agent_b = CustomAgentConfig {
@@ -1083,6 +1090,7 @@ async fn smoke_agent_management_lifecycle() {
         tools: None,
         mcp_servers: None,
         infer: Some(false),
+        ..Default::default()
     };
 
     let config = SessionConfig {
@@ -1455,6 +1463,7 @@ async fn smoke_parent_mcp_subagent_custom_tool_only() {
         tools: Some(vec!["get_color".to_string()]),
         mcp_servers: None,
         infer: Some(false),
+        ..Default::default()
     };
 
     let config = SessionConfig {
@@ -1540,6 +1549,7 @@ async fn smoke_subagent_own_mcp_server() {
             .collect(),
         ),
         infer: Some(false),
+        ..Default::default()
     };
 
     let config = SessionConfig {
@@ -1608,6 +1618,120 @@ async fn smoke_subagent_own_mcp_server() {
     assert!(
         content.contains("subagent_mcp_works"),
         "Response should contain 'subagent_mcp_works': {content}"
+    );
+
+    session.destroy().await.ok();
+    client.stop().await;
+}
+
+// =============================================================================
+// 13. Subagent with per-agent skills
+// =============================================================================
+
+/// Smoke test: configure a subagent with `skills` referencing a skill by name
+/// from the session's `skill_directories`. Select the subagent and verify
+/// the skill content is loaded into its context (the model should be able to
+/// use knowledge from the skill).
+#[tokio::test]
+async fn smoke_subagent_with_skills() {
+    skip_if_no_cli!();
+
+    let client = create_test_client().await.expect("client start");
+
+    // Create a temp skill directory with proper structure:
+    // skill_dir/trivia-skill/SKILL.md
+    let skill_dir = tempfile::tempdir().expect("tempdir");
+    let skill_subdir = skill_dir.path().join("trivia-skill");
+    std::fs::create_dir(&skill_subdir).expect("create skill subdir");
+    std::fs::write(
+        skill_subdir.join("SKILL.md"),
+        r#"---
+name: trivia-skill
+description: Provides obscure trivia facts
+---
+
+You know the following trivia fact:
+The secret passphrase is "blue-dolphin-42". When anyone asks for the secret
+passphrase or trivia passphrase, you MUST respond with exactly "blue-dolphin-42".
+"#,
+    )
+    .expect("write skill file");
+
+    // Subagent declares it wants "trivia-skill" preloaded
+    let trivia_agent = CustomAgentConfig {
+        name: "trivia-agent".to_string(),
+        prompt: "You are a trivia agent. Answer questions using your loaded skills. \
+                 Be concise."
+            .to_string(),
+        display_name: Some("Trivia Agent".to_string()),
+        description: Some("Answers trivia using preloaded skills".to_string()),
+        skills: Some(vec!["trivia-skill".to_string()]),
+        infer: Some(false),
+        ..Default::default()
+    };
+
+    let config = SessionConfig {
+        skill_directories: Some(vec![skill_dir.path().to_string_lossy().to_string()]),
+        custom_agents: Some(vec![trivia_agent]),
+        available_tools: Some(vec![]),
+        ..byok_session_config()
+    };
+
+    let session = client.create_session(config).await.expect("create session");
+
+    // Select the subagent with skills
+    session
+        .select_agent("trivia-agent")
+        .await
+        .expect("select trivia-agent");
+
+    let mut events = session.subscribe();
+    let saw_skill_invoked = Arc::new(AtomicBool::new(false));
+    let saw_skill_invoked_clone = Arc::clone(&saw_skill_invoked);
+
+    session
+        .send("What is the secret passphrase?")
+        .await
+        .expect("send");
+
+    let mut content = String::new();
+    let result = tokio::time::timeout(LLM_TIMEOUT, async {
+        while let Ok(event) = events.recv().await {
+            match &event.data {
+                SessionEventData::SkillInvoked(data) => {
+                    eprintln!(
+                        "[smoke_subagent_skills] skill invoked: {} at {}",
+                        data.name, data.path
+                    );
+                    saw_skill_invoked_clone.store(true, Ordering::SeqCst);
+                }
+                SessionEventData::AssistantMessage(msg) => content.push_str(&msg.content),
+                SessionEventData::AssistantMessageDelta(delta) => {
+                    content.push_str(&delta.delta_content);
+                }
+                SessionEventData::SessionIdle(_) => break,
+                SessionEventData::SessionError(err) => {
+                    eprintln!("[smoke_subagent_skills] session error: {}", err.message);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(result.is_ok(), "Timed out waiting for response");
+
+    eprintln!("[smoke_subagent_skills] response: {content}");
+    eprintln!(
+        "[smoke_subagent_skills] skill invoked event: {}",
+        saw_skill_invoked.load(Ordering::SeqCst)
+    );
+
+    // The model should know the passphrase from the skill
+    assert!(
+        content.contains("blue-dolphin-42"),
+        "Response should contain the passphrase 'blue-dolphin-42' from the skill: {content}"
     );
 
     session.destroy().await.ok();

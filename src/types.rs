@@ -478,6 +478,10 @@ pub struct CustomAgentConfig {
     pub mcp_servers: Option<HashMap<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub infer: Option<bool>,
+    /// List of skill names to preload into this agent's context.
+    /// When omitted, no skills are preloaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
 }
 
 // =============================================================================

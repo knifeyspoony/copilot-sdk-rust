@@ -171,6 +171,7 @@ async fn test_list_agents() {
                 tools: None,
                 mcp_servers: None,
                 infer: Some(true),
+                ..Default::default()
             }]),
             ..byok_session_config()
         })
@@ -217,6 +218,7 @@ async fn test_select_and_deselect_agent() {
                 tools: None,
                 mcp_servers: None,
                 infer: Some(true),
+                ..Default::default()
             }]),
             ..byok_session_config()
         })
@@ -400,6 +402,7 @@ async fn test_session_with_agent_option() {
                 tools: None,
                 mcp_servers: None,
                 infer: Some(true),
+                ..Default::default()
             }]),
             agent: Some("starter-agent".into()),
             ..byok_session_config()

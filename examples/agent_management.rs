@@ -20,6 +20,7 @@ async fn main() -> copilot_sdk::Result<()> {
                 tools: None,
                 mcp_servers: None,
                 infer: None,
+                ..Default::default()
             }]),
             ..Default::default()
         })
