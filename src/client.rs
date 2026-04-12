@@ -410,7 +410,9 @@ async fn handle_hooks_invoke(
         ),
     }
 
-    result
+    // The server reads `.output` from the RPC result, so wrap the hook
+    // handler's return value: `{ "output": <handler_result> }`.
+    result.map(|v| serde_json::json!({ "output": v }))
 }
 
 fn preview_json(value: &Value) -> String {
