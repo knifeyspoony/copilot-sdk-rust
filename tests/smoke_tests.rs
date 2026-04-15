@@ -163,7 +163,9 @@ async fn smoke_agent_with_tool() {
     let tool_called_clone = Arc::clone(&tool_called);
 
     let tool = Tool::new("lookup_magic_number")
-        .description("Returns a secret magic number. Call this tool when asked for the magic number.")
+        .description(
+            "Returns a secret magic number. Call this tool when asked for the magic number.",
+        )
         .schema(serde_json::json!({
             "type": "object",
             "properties": {
@@ -463,10 +465,7 @@ async fn smoke_agent_with_subagent() {
                 }
                 SessionEventData::SessionIdle(_) => break,
                 SessionEventData::SessionError(err) => {
-                    eprintln!(
-                        "[smoke_agent_with_subagent] session error: {}",
-                        err.message
-                    );
+                    eprintln!("[smoke_agent_with_subagent] session error: {}", err.message);
                     break;
                 }
                 _ => {}
@@ -566,10 +565,7 @@ async fn smoke_subagent_with_custom_tool() {
                     .get("fruit")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                eprintln!(
-                    "[smoke_subagent_tool] tool invoked for fruit: {}",
-                    fruit
-                );
+                eprintln!("[smoke_subagent_tool] tool invoked for fruit: {}", fruit);
                 ToolResultObject::text(format!("{} costs $3.47 per pound", fruit))
             })),
         )
@@ -597,33 +593,51 @@ async fn smoke_subagent_with_custom_tool() {
             match &event.data {
                 SessionEventData::CustomAgentStarted(data) => {
                     eprintln!("[smoke_subagent_tool] agent started: {}", data.agent_name);
-                    event_log_clone.lock().await.push(format!("agent_started:{}", data.agent_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_started:{}", data.agent_name));
                 }
                 SessionEventData::CustomAgentSelected(data) => {
                     eprintln!("[smoke_subagent_tool] agent selected: {}", data.agent_name);
-                    event_log_clone.lock().await.push(format!("agent_selected:{}", data.agent_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_selected:{}", data.agent_name));
                 }
                 SessionEventData::ToolExecutionStart(t) => {
                     eprintln!("[smoke_subagent_tool] tool start: {}", t.tool_name);
-                    event_log_clone.lock().await.push(format!("tool_start:{}", t.tool_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("tool_start:{}", t.tool_name));
                 }
                 SessionEventData::ToolExecutionComplete(t) => {
                     eprintln!(
                         "[smoke_subagent_tool] tool complete: {} success={}",
                         t.tool_call_id, t.success
                     );
-                    event_log_clone.lock().await.push("tool_complete".to_string());
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push("tool_complete".to_string());
                 }
                 SessionEventData::CustomAgentCompleted(data) => {
                     eprintln!("[smoke_subagent_tool] agent completed: {}", data.agent_name);
-                    event_log_clone.lock().await.push(format!("agent_completed:{}", data.agent_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_completed:{}", data.agent_name));
                 }
                 SessionEventData::CustomAgentFailed(data) => {
                     eprintln!(
                         "[smoke_subagent_tool] agent FAILED: {} — {}",
                         data.agent_name, data.error
                     );
-                    event_log_clone.lock().await.push(format!("agent_failed:{}", data.agent_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_failed:{}", data.agent_name));
                 }
                 SessionEventData::AssistantMessage(msg) => {
                     content.push_str(&msg.content);
@@ -657,7 +671,8 @@ async fn smoke_subagent_with_custom_tool() {
 
     // 2. We saw the tool execution events
     assert!(
-        log.iter().any(|e| e.starts_with("tool_start:get_fruit_price")),
+        log.iter()
+            .any(|e| e.starts_with("tool_start:get_fruit_price")),
         "Should have seen ToolExecutionStart for get_fruit_price. Log: {:?}",
         *log
     );
@@ -811,35 +826,73 @@ async fn smoke_subagent_selected_with_custom_tool() {
         while let Ok(event) = events.recv().await {
             match &event.data {
                 SessionEventData::CustomAgentSelected(data) => {
-                    eprintln!("[smoke_subagent_selected] agent selected: {}", data.agent_name);
-                    event_log_clone.lock().await.push(format!("agent_selected:{}", data.agent_name));
+                    eprintln!(
+                        "[smoke_subagent_selected] agent selected: {}",
+                        data.agent_name
+                    );
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_selected:{}", data.agent_name));
                 }
                 SessionEventData::CustomAgentStarted(data) => {
-                    eprintln!("[smoke_subagent_selected] agent started: {}", data.agent_name);
-                    event_log_clone.lock().await.push(format!("agent_started:{}", data.agent_name));
+                    eprintln!(
+                        "[smoke_subagent_selected] agent started: {}",
+                        data.agent_name
+                    );
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_started:{}", data.agent_name));
                 }
                 SessionEventData::ToolExecutionStart(t) => {
                     eprintln!("[smoke_subagent_selected] tool start: {}", t.tool_name);
-                    event_log_clone.lock().await.push(format!("tool_start:{}", t.tool_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("tool_start:{}", t.tool_name));
                 }
                 SessionEventData::ToolExecutionComplete(t) => {
-                    eprintln!("[smoke_subagent_selected] tool complete: {} success={}", t.tool_call_id, t.success);
-                    event_log_clone.lock().await.push(format!("tool_complete:{}", t.tool_call_id));
+                    eprintln!(
+                        "[smoke_subagent_selected] tool complete: {} success={}",
+                        t.tool_call_id, t.success
+                    );
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("tool_complete:{}", t.tool_call_id));
                 }
                 SessionEventData::CustomAgentCompleted(data) => {
-                    eprintln!("[smoke_subagent_selected] agent completed: {}", data.agent_name);
-                    event_log_clone.lock().await.push(format!("agent_completed:{}", data.agent_name));
+                    eprintln!(
+                        "[smoke_subagent_selected] agent completed: {}",
+                        data.agent_name
+                    );
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_completed:{}", data.agent_name));
                 }
                 SessionEventData::CustomAgentFailed(data) => {
-                    eprintln!("[smoke_subagent_selected] agent FAILED: {} — {}", data.agent_name, data.error);
-                    event_log_clone.lock().await.push(format!("agent_failed:{}", data.agent_name));
+                    eprintln!(
+                        "[smoke_subagent_selected] agent FAILED: {} — {}",
+                        data.agent_name, data.error
+                    );
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("agent_failed:{}", data.agent_name));
                 }
                 SessionEventData::SubagentDeselected(_) => {
                     eprintln!("[smoke_subagent_selected] subagent deselected");
-                    event_log_clone.lock().await.push("subagent_deselected".to_string());
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push("subagent_deselected".to_string());
                 }
                 SessionEventData::AssistantMessage(msg) => content.push_str(&msg.content),
-                SessionEventData::AssistantMessageDelta(delta) => content.push_str(&delta.delta_content),
+                SessionEventData::AssistantMessageDelta(delta) => {
+                    content.push_str(&delta.delta_content)
+                }
                 SessionEventData::SessionIdle(_) => break,
                 SessionEventData::SessionError(err) => {
                     eprintln!("[smoke_subagent_selected] session error: {}", err.message);
@@ -866,7 +919,8 @@ async fn smoke_subagent_selected_with_custom_tool() {
 
     // 2. The tool execution event fired
     assert!(
-        log.iter().any(|e| e.starts_with("tool_start:get_fruit_price")),
+        log.iter()
+            .any(|e| e.starts_with("tool_start:get_fruit_price")),
         "Should see ToolExecutionStart for get_fruit_price. Log: {:?}",
         *log
     );
@@ -881,10 +935,16 @@ async fn smoke_subagent_selected_with_custom_tool() {
     //    (it wasn't deselected mid-turn)
     match session.get_current_agent().await {
         Ok(current_after) => {
-            eprintln!("[smoke_subagent_selected] agent after tool call: {:?}", current_after);
+            eprintln!(
+                "[smoke_subagent_selected] agent after tool call: {:?}",
+                current_after
+            );
         }
         Err(e) => {
-            eprintln!("[smoke_subagent_selected] get_current_agent not supported ({})", e);
+            eprintln!(
+                "[smoke_subagent_selected] get_current_agent not supported ({})",
+                e
+            );
         }
     }
 
@@ -1000,7 +1060,10 @@ async fn smoke_subagent_tool_scoping() {
         .await;
 
     // ── Round 1: select fruit-agent, ask about fruit ──────────────────
-    session.select_agent("fruit-agent").await.expect("select fruit-agent");
+    session
+        .select_agent("fruit-agent")
+        .await
+        .expect("select fruit-agent");
 
     let response = tokio::time::timeout(
         LLM_TIMEOUT,
@@ -1026,7 +1089,10 @@ async fn smoke_subagent_tool_scoping() {
     session.deselect_agent().await.expect("deselect");
 
     // ── Round 2: select veggie-agent, ask about veggies ───────────────
-    session.select_agent("veggie-agent").await.expect("select veggie-agent");
+    session
+        .select_agent("veggie-agent")
+        .await
+        .expect("select veggie-agent");
 
     let response2 = tokio::time::timeout(
         LLM_TIMEOUT,
@@ -1106,7 +1172,10 @@ async fn smoke_agent_management_lifecycle() {
 
     // Select agent-alpha
     let select_result = session.select_agent("agent-alpha").await;
-    eprintln!("[smoke_agent_management] select result: {:?}", select_result);
+    eprintln!(
+        "[smoke_agent_management] select result: {:?}",
+        select_result
+    );
 
     // Check current agent
     let current = session.get_current_agent().await;
@@ -1120,13 +1189,10 @@ async fn smoke_agent_management_lifecycle() {
     );
 
     // The session should still work after deselect
-    let response = tokio::time::timeout(
-        LLM_TIMEOUT,
-        session.send_and_collect("Say 'ok'", None),
-    )
-    .await
-    .expect("timeout")
-    .expect("send_and_collect");
+    let response = tokio::time::timeout(LLM_TIMEOUT, session.send_and_collect("Say 'ok'", None))
+        .await
+        .expect("timeout")
+        .expect("send_and_collect");
 
     eprintln!("[smoke_agent_management] response: {response}");
     assert!(!response.is_empty(), "Should get a response after deselect");
@@ -1164,7 +1230,9 @@ async fn smoke_agent_multi_tool_streaming() {
         }));
 
     let multiply_tool = Tool::new("multiply_numbers")
-        .description("Multiplies two numbers and returns the product. Always use this for multiplication.")
+        .description(
+            "Multiplies two numbers and returns the product. Always use this for multiplication.",
+        )
         .schema(serde_json::json!({
             "type": "object",
             "properties": {
@@ -1265,10 +1333,7 @@ async fn smoke_agent_multi_tool_streaming() {
     eprintln!("[smoke_multi_tool] response: {content}");
     eprintln!("[smoke_multi_tool] streaming deltas: {got_streaming_delta}");
 
-    assert!(
-        got_streaming_delta,
-        "Should have received streaming deltas"
-    );
+    assert!(got_streaming_delta, "Should have received streaming deltas");
     assert!(
         add_called.load(Ordering::SeqCst),
         "add_numbers tool should have been called"
@@ -1298,8 +1363,8 @@ async fn smoke_agent_multi_tool_streaming() {
 
 /// Path to the test MCP echo server script.
 fn mcp_echo_server_path() -> String {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/mcp_echo_server.js");
+    let p =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_echo_server.js");
     assert!(p.exists(), "MCP echo server not found at {:?}", p);
     p.to_string_lossy().to_string()
 }
@@ -1378,14 +1443,25 @@ async fn smoke_parent_with_mcp_tool() {
             match &event.data {
                 SessionEventData::ToolExecutionStart(t) => {
                     eprintln!("[smoke_parent_mcp] tool start: {}", t.tool_name);
-                    event_log_clone.lock().await.push(format!("tool_start:{}", t.tool_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("tool_start:{}", t.tool_name));
                 }
                 SessionEventData::ToolExecutionComplete(t) => {
-                    eprintln!("[smoke_parent_mcp] tool complete: {} success={}", t.tool_call_id, t.success);
-                    event_log_clone.lock().await.push(format!("tool_complete:{}", t.success));
+                    eprintln!(
+                        "[smoke_parent_mcp] tool complete: {} success={}",
+                        t.tool_call_id, t.success
+                    );
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("tool_complete:{}", t.success));
                 }
                 SessionEventData::AssistantMessage(msg) => content.push_str(&msg.content),
-                SessionEventData::AssistantMessageDelta(delta) => content.push_str(&delta.delta_content),
+                SessionEventData::AssistantMessageDelta(delta) => {
+                    content.push_str(&delta.delta_content)
+                }
                 SessionEventData::SessionIdle(_) => break,
                 SessionEventData::SessionError(err) => {
                     eprintln!("[smoke_parent_mcp] session error: {}", err.message);
@@ -1492,7 +1568,10 @@ async fn smoke_parent_mcp_subagent_custom_tool_only() {
         .await;
 
     // Select the subagent — it should only have get_color, not echo
-    session.select_agent("color-agent").await.expect("select color-agent");
+    session
+        .select_agent("color-agent")
+        .await
+        .expect("select color-agent");
 
     let response = tokio::time::timeout(
         LLM_TIMEOUT,
@@ -1565,7 +1644,10 @@ async fn smoke_subagent_own_mcp_server() {
         .await;
 
     // Select the subagent that has its own MCP server
-    session.select_agent("echo-agent").await.expect("select echo-agent");
+    session
+        .select_agent("echo-agent")
+        .await
+        .expect("select echo-agent");
 
     let mut events = session.subscribe();
     let event_log = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
@@ -1582,14 +1664,25 @@ async fn smoke_subagent_own_mcp_server() {
             match &event.data {
                 SessionEventData::ToolExecutionStart(t) => {
                     eprintln!("[smoke_subagent_mcp] tool start: {}", t.tool_name);
-                    event_log_clone.lock().await.push(format!("tool_start:{}", t.tool_name));
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("tool_start:{}", t.tool_name));
                 }
                 SessionEventData::ToolExecutionComplete(t) => {
-                    eprintln!("[smoke_subagent_mcp] tool complete: {} success={}", t.tool_call_id, t.success);
-                    event_log_clone.lock().await.push(format!("tool_complete:{}", t.success));
+                    eprintln!(
+                        "[smoke_subagent_mcp] tool complete: {} success={}",
+                        t.tool_call_id, t.success
+                    );
+                    event_log_clone
+                        .lock()
+                        .await
+                        .push(format!("tool_complete:{}", t.success));
                 }
                 SessionEventData::AssistantMessage(msg) => content.push_str(&msg.content),
-                SessionEventData::AssistantMessageDelta(delta) => content.push_str(&delta.delta_content),
+                SessionEventData::AssistantMessageDelta(delta) => {
+                    content.push_str(&delta.delta_content)
+                }
                 SessionEventData::SessionIdle(_) => break,
                 SessionEventData::SessionError(err) => {
                     eprintln!("[smoke_subagent_mcp] session error: {}", err.message);
