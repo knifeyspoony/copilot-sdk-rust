@@ -1027,6 +1027,12 @@ pub struct SessionConfig {
     #[serde(skip_serializing_if = "Option::is_none", rename = "requestUserInput")]
     pub request_user_input: Option<bool>,
 
+    /// Whether to request elicitation support from the server.
+    /// When true, `elicitation.requested` events will be sent to the SDK.
+    /// Auto-set to `true` when an elicitation handler is registered.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "requestElicitation")]
+    pub request_elicitation: Option<bool>,
+
     /// Reasoning effort level: "low", "medium", "high", or "xhigh".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -1107,6 +1113,10 @@ pub struct ResumeSessionConfig {
     /// Whether to request user input forwarding from the server.
     #[serde(skip_serializing_if = "Option::is_none", rename = "requestUserInput")]
     pub request_user_input: Option<bool>,
+
+    /// Whether to request elicitation support from the server.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "requestElicitation")]
+    pub request_elicitation: Option<bool>,
 
     /// Reasoning effort level: "low", "medium", "high", or "xhigh".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1521,11 +1531,18 @@ pub struct UserInputInvocation {
 /// Request for structured user input via elicitation.
 ///
 /// Wraps the elicitation broadcast event data into a handler-friendly struct.
+/// Mirrors the Go SDK's `ElicitationContext`.
 #[derive(Debug, Clone)]
 pub struct ElicitationRequest {
     pub request_id: String,
     pub message: Option<String>,
     pub requested_schema: Option<serde_json::Value>,
+    /// Elicitation mode: "form" for structured input, "url" for browser redirect.
+    pub mode: Option<String>,
+    /// The source that initiated the request (e.g. MCP server name).
+    pub elicitation_source: Option<String>,
+    /// URL to open in the user's browser (url mode only).
+    pub url: Option<String>,
 }
 
 /// Response to an elicitation request.

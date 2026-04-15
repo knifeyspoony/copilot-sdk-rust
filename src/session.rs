@@ -395,8 +395,61 @@ impl Session {
             SessionEventData::CommandExecute(data) => {
                 self.handle_command_execute(data).await;
             }
+            SessionEventData::ElicitationRequested(data) => {
+                self.handle_elicitation_requested(data).await;
+            }
             _ => {} // Not a broadcast request event
         }
+    }
+
+    async fn handle_elicitation_requested(&self, data: &crate::events::ElicitationRequestedData) {
+        let handler = {
+            let state = self.state.read().await;
+            state.elicitation_handler.clone()
+        };
+        let handler = match handler {
+            Some(h) => h,
+            None => return,
+        };
+
+        let session_id = self.session_id.clone();
+        let request_id = data.request_id.clone();
+
+        // CLI uses both `question` and `message` — prefer `message`, fall back to `question`
+        let message = data.message.clone().or_else(|| data.question.clone());
+
+        let request = ElicitationRequest {
+            request_id: request_id.clone(),
+            message,
+            requested_schema: data.requested_schema.clone(),
+            mode: data.mode.clone(),
+            elicitation_source: data.elicitation_source.clone(),
+            url: data.url.clone(),
+        };
+
+        let response = handler(request).await;
+
+        let result_action = if response.dismissed {
+            "cancel"
+        } else if response.result.is_some() {
+            "accept"
+        } else {
+            "decline"
+        };
+
+        let mut result_obj = serde_json::json!({ "action": result_action });
+        if let Some(content) = &response.result {
+            result_obj["content"] = content.clone();
+        }
+
+        let params = serde_json::json!({
+            "sessionId": session_id,
+            "requestId": request_id,
+            "result": result_obj,
+        });
+
+        let _ =
+            (self.invoke_fn)("session.elicitation.handlePendingElicitation", Some(params)).await;
     }
 
     async fn handle_command_execute(&self, data: &crate::events::CommandExecuteData) {
