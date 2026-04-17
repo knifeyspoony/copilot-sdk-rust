@@ -65,6 +65,15 @@ pub struct ToolRequestItem {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<serde_json::Value>,
+    /// Human-readable display title for the tool (e.g. "Grep", "Edit").
+    /// Populated by the CLI for built-in tools and MCP tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_title: Option<String>,
+    /// Model-generated one-line natural-language summary of what this
+    /// specific tool call does (e.g. "Install dependencies" for a bash
+    /// `npm install`). May be absent or explicitly null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intention_summary: Option<String>,
 }
 
 /// Tool execution result content.
@@ -303,6 +312,8 @@ pub struct AssistantUsageData {
     pub provider_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_snapshots: Option<HashMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
 }
 
 /// Data for abort event.
