@@ -1152,6 +1152,39 @@ impl Client {
             .map(|s| s.to_string()))
     }
 
+    /// Fork a session, creating a new session with the same conversation history.
+    ///
+    /// Uses the `sessions.fork` RPC to copy the source session's on-disk
+    /// event stream to a new session ID. The forked session can then be
+    /// resumed via [`resume_session`] to get a live session with full
+    /// conversation context.
+    ///
+    /// If `to_event_id` is provided, only events *before* that ID (exclusive)
+    /// are included in the fork. When omitted, all events are copied.
+    ///
+    /// **Experimental**: This API may change or be removed.
+    pub async fn fork_session(
+        &self,
+        source_session_id: &str,
+        to_event_id: Option<&str>,
+    ) -> Result<String> {
+        self.ensure_connected().await?;
+
+        let mut params = json!({ "sessionId": source_session_id });
+        if let Some(event_id) = to_event_id {
+            params["toEventId"] = json!(event_id);
+        }
+
+        let result = self.invoke("sessions.fork", Some(params)).await?;
+
+        let new_id = result
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CopilotError::Protocol("missing sessionId in fork response".into()))?;
+
+        Ok(new_id.to_string())
+    }
+
     // =========================================================================
     // Server Communication
     // =========================================================================

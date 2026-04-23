@@ -644,15 +644,24 @@ impl Session {
     /// Handle a permission request.
     ///
     /// Delegates to the registered permission handler, or denies by default
-    /// if no handler is set.
+    /// if no handler is set. The handler is run via `spawn_blocking` because
+    /// permission handlers typically block waiting for user input and must
+    /// not stall the tokio worker thread pool.
     pub async fn handle_permission_request(
         &self,
         request: &PermissionRequest,
     ) -> PermissionRequestResult {
-        let state = self.state.read().await;
+        let handler = {
+            let state = self.state.read().await;
+            state.permission_handler.clone()
+        };
 
-        if let Some(handler) = &state.permission_handler {
-            handler(request)
+        if let Some(handler) = handler {
+            let request = request.clone();
+            match tokio::task::spawn_blocking(move || handler(&request)).await {
+                Ok(result) => result,
+                Err(_) => PermissionRequestResult::denied(),
+            }
         } else {
             // Default: deny all permissions
             PermissionRequestResult::denied()
@@ -673,16 +682,30 @@ impl Session {
     }
 
     /// Handle a user input request from the server.
+    ///
+    /// The handler is run via `spawn_blocking` because user input handlers
+    /// typically block waiting for user input and must not stall the tokio
+    /// worker thread pool.
     pub async fn handle_user_input_request(
         &self,
         request: &UserInputRequest,
     ) -> Result<UserInputResponse> {
-        let state = self.state.read().await;
-        if let Some(handler) = &state.user_input_handler {
+        let handler = {
+            let state = self.state.read().await;
+            state.user_input_handler.clone()
+        };
+
+        if let Some(handler) = handler {
             let invocation = UserInputInvocation {
                 session_id: self.session_id.clone(),
             };
-            Ok(handler(request, &invocation))
+            let request = request.clone();
+            match tokio::task::spawn_blocking(move || handler(&request, &invocation)).await {
+                Ok(result) => Ok(result),
+                Err(_) => Err(CopilotError::Protocol(
+                    "User input handler was cancelled".into(),
+                )),
+            }
         } else {
             Err(CopilotError::Protocol(
                 "No user input handler registered".into(),
