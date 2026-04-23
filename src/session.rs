@@ -512,11 +512,8 @@ impl Session {
                     "result": result_obj,
                 });
 
-                let _ = invoke_fn(
-                    "session.elicitation.handlePendingElicitation",
-                    Some(params),
-                )
-                .await;
+                let _ =
+                    invoke_fn("session.elicitation.handlePendingElicitation", Some(params)).await;
             }
             _ => {}
         }
@@ -526,13 +523,8 @@ impl Session {
     /// and backward-compat paths). Delegates to the static version.
     #[allow(dead_code)]
     async fn handle_broadcast_event(&self, event: &SessionEvent) {
-        Self::handle_broadcast_event_static(
-            &self.state,
-            &self.invoke_fn,
-            &self.session_id,
-            event,
-        )
-        .await;
+        Self::handle_broadcast_event_static(&self.state, &self.invoke_fn, &self.session_id, event)
+            .await;
     }
 
     // =========================================================================
