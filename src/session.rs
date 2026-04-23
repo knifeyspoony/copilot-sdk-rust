@@ -253,9 +253,24 @@ impl Session {
     ///
     /// This is called by the Client when events are received.
     pub async fn dispatch_event(&self, event: SessionEvent) {
-        // Handle broadcast request events (protocol v3) before dispatching to user handlers.
-        // Fire-and-forget: the response is sent asynchronously via RPC.
-        self.handle_broadcast_event(&event).await;
+        // Spawn broadcast request handling (permission, tool, elicitation)
+        // so it doesn't block the event dispatcher. These are fire-and-forget:
+        // the handler sends the RPC response itself.
+        if event.data.is_broadcast_request() {
+            let state = Arc::clone(&self.state);
+            let invoke_fn = Arc::clone(&self.invoke_fn);
+            let session_id = self.session_id.clone();
+            let event_clone = event.clone();
+            tokio::spawn(async move {
+                Session::handle_broadcast_event_static(
+                    &state,
+                    &invoke_fn,
+                    &session_id,
+                    &event_clone,
+                )
+                .await;
+            });
+        }
 
         // Send to broadcast channel
         let _ = self.event_tx.send(event.clone());
@@ -271,7 +286,15 @@ impl Session {
     ///
     /// Implements the protocol v3 broadcast model where tool calls and permission requests
     /// are broadcast as session events to all clients.
-    async fn handle_broadcast_event(&self, event: &SessionEvent) {
+    ///
+    /// Static variant that takes Arc-cloned fields so it can be spawned into a
+    /// separate task without borrowing `&self`.
+    async fn handle_broadcast_event_static(
+        state: &Arc<RwLock<SessionState>>,
+        invoke_fn: &Arc<InvokeFn>,
+        session_id: &str,
+        event: &SessionEvent,
+    ) {
         match &event.data {
             SessionEventData::ExternalToolRequested(data) => {
                 let request_id = match &data.request_id {
@@ -284,21 +307,31 @@ impl Session {
                 };
 
                 // Check if this session handles this tool
-                if self.get_tool(&tool_name).await.is_none() {
-                    return; // This client doesn't handle this tool; another client will.
+                {
+                    let st = state.read().await;
+                    if !st.tools.contains_key(&tool_name) {
+                        return;
+                    }
                 }
 
-                let _tool_call_id = data.tool_call_id.clone().unwrap_or_default();
                 let arguments = data.arguments.clone().unwrap_or(serde_json::json!({}));
-                let session_id = self.session_id.clone();
 
-                // Execute tool and respond via handlePendingToolCall RPC
-                match self.invoke_tool(&tool_name, &arguments).await {
+                // Execute tool
+                let tool_result = {
+                    let st = state.read().await;
+                    let registered = match st.tools.get(&tool_name) {
+                        Some(r) => r,
+                        None => return,
+                    };
+                    match &registered.handler {
+                        Some(handler) => Ok(handler(&tool_name, &arguments)),
+                        None => Err(format!("No handler for tool: {}", tool_name)),
+                    }
+                };
+
+                let params = match tool_result {
                     Ok(result) => {
-                        // If the tool reported a failure with an error, send via top-level error
-                        let params = if result.result_type == "failure"
-                            || result.result_type == "error"
-                        {
+                        if result.result_type == "failure" || result.result_type == "error" {
                             serde_json::json!({
                                 "sessionId": session_id,
                                 "requestId": request_id,
@@ -314,22 +347,17 @@ impl Session {
                                     "toolTelemetry": result.tool_telemetry.unwrap_or_default(),
                                 }
                             })
-                        };
-                        let _ =
-                            (self.invoke_fn)("session.tools.handlePendingToolCall", Some(params))
-                                .await;
+                        }
                     }
                     Err(e) => {
-                        let params = serde_json::json!({
+                        serde_json::json!({
                             "sessionId": session_id,
                             "requestId": request_id,
-                            "error": e.to_string(),
-                        });
-                        let _ =
-                            (self.invoke_fn)("session.tools.handlePendingToolCall", Some(params))
-                                .await;
+                            "error": e,
+                        })
                     }
-                }
+                };
+                let _ = invoke_fn("session.tools.handlePendingToolCall", Some(params)).await;
             }
             SessionEventData::PermissionRequested(data) => {
                 let request_id = match &data.request_id {
@@ -341,9 +369,6 @@ impl Session {
                     None => return,
                 };
 
-                let session_id = self.session_id.clone();
-
-                // Build PermissionRequest from JSON
                 use crate::types::PermissionRequest;
                 let kind = perm_data
                     .get("kind")
@@ -369,7 +394,19 @@ impl Session {
                     extension_data,
                 };
 
-                let result = self.handle_permission_request(&request).await;
+                // Run permission handler via spawn_blocking
+                let handler = {
+                    let st = state.read().await;
+                    st.permission_handler.clone()
+                };
+                let result = if let Some(handler) = handler {
+                    match tokio::task::spawn_blocking(move || handler(&request)).await {
+                        Ok(r) => r,
+                        Err(_) => PermissionRequestResult::denied(),
+                    }
+                } else {
+                    PermissionRequestResult::denied()
+                };
 
                 let mut perm_result_inner = serde_json::json!({
                     "kind": result.kind,
@@ -386,20 +423,116 @@ impl Session {
                     "result": perm_result_inner,
                 });
 
-                let _ = (self.invoke_fn)(
+                let _ = invoke_fn(
                     "session.permissions.handlePendingPermissionRequest",
                     Some(perm_result),
                 )
                 .await;
             }
             SessionEventData::CommandExecute(data) => {
-                self.handle_command_execute(data).await;
+                let handler = {
+                    let st = state.read().await;
+                    st.command_handlers.get(&data.command_name).cloned()
+                };
+
+                let request_id = data.request_id.clone();
+
+                let result = if let Some(handler) = handler {
+                    let ctx = crate::types::CommandContext {
+                        session_id: session_id.to_string(),
+                        command: data.command.clone(),
+                        command_name: data.command_name.clone(),
+                        args: data.args.clone(),
+                    };
+                    handler(ctx).await
+                } else {
+                    Err(CopilotError::Protocol(format!(
+                        "no handler for command /{}",
+                        data.command_name
+                    )))
+                };
+
+                let params = match result {
+                    Ok(()) => serde_json::json!({
+                        "sessionId": session_id,
+                        "requestId": request_id,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "sessionId": session_id,
+                        "requestId": request_id,
+                        "error": e.to_string(),
+                    }),
+                };
+
+                let _ = invoke_fn("session.commands.handlePendingCommand", Some(params)).await;
             }
             SessionEventData::ElicitationRequested(data) => {
-                self.handle_elicitation_requested(data).await;
+                let handler = {
+                    let st = state.read().await;
+                    st.elicitation_handler.clone()
+                };
+                let handler = match handler {
+                    Some(h) => h,
+                    None => return,
+                };
+
+                let request_id = data.request_id.clone();
+
+                // CLI uses both `question` and `message` — prefer `message`, fall back to `question`
+                let message = data.message.clone().or_else(|| data.question.clone());
+
+                use crate::types::ElicitationRequest;
+                let request = ElicitationRequest {
+                    request_id: request_id.clone(),
+                    message,
+                    requested_schema: data.requested_schema.clone(),
+                    mode: data.mode.clone(),
+                    elicitation_source: data.elicitation_source.clone(),
+                    url: data.url.clone(),
+                };
+
+                let response = handler(request).await;
+
+                let result_action = if response.dismissed {
+                    "cancel"
+                } else if response.result.is_some() {
+                    "accept"
+                } else {
+                    "decline"
+                };
+
+                let mut result_obj = serde_json::json!({ "action": result_action });
+                if let Some(content) = &response.result {
+                    result_obj["content"] = content.clone();
+                }
+
+                let params = serde_json::json!({
+                    "sessionId": session_id,
+                    "requestId": request_id,
+                    "result": result_obj,
+                });
+
+                let _ = invoke_fn(
+                    "session.elicitation.handlePendingElicitation",
+                    Some(params),
+                )
+                .await;
             }
-            _ => {} // Not a broadcast request event
+            _ => {}
         }
+    }
+
+    /// Handle broadcast request events (instance method, used only in tests
+    /// and backward-compat paths). Delegates to the static version.
+    #[allow(dead_code)]
+    async fn handle_broadcast_event(&self, event: &SessionEvent) {
+        Self::handle_broadcast_event_static(
+            &self.state,
+            &self.invoke_fn,
+            &self.session_id,
+            event,
+        )
+        .await;
     }
 
     async fn handle_elicitation_requested(&self, data: &crate::events::ElicitationRequestedData) {
@@ -1462,6 +1595,8 @@ mod tests {
         .unwrap();
 
         session.dispatch_event(event).await;
+        // Allow spawned broadcast handler to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let forwarded = subscription.recv().await.unwrap();
         assert_eq!(forwarded.event_type, "external_tool.requested");
@@ -1516,6 +1651,8 @@ mod tests {
         .unwrap();
 
         session.dispatch_event(event).await;
+        // Allow spawned broadcast handler to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let forwarded = subscription.recv().await.unwrap();
         assert_eq!(forwarded.event_type, "permission.requested");
@@ -1737,6 +1874,8 @@ mod tests {
         .unwrap();
 
         session.dispatch_event(event).await;
+        // Allow spawned broadcast handler to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Handler was invoked
         assert!(*handler_called.lock().unwrap());
@@ -1777,6 +1916,8 @@ mod tests {
         .unwrap();
 
         session.dispatch_event(event).await;
+        // Allow spawned broadcast handler to complete
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let calls = rpc_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);

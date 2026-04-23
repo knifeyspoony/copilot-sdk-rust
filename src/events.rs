@@ -887,6 +887,21 @@ pub enum SessionEventData {
     Unknown(serde_json::Value),
 }
 
+impl SessionEventData {
+    /// Returns true for event types that represent broadcast requests
+    /// (permission, tool, elicitation, command) which require async
+    /// handling and should be spawned rather than awaited inline.
+    pub fn is_broadcast_request(&self) -> bool {
+        matches!(
+            self,
+            SessionEventData::ExternalToolRequested(_)
+                | SessionEventData::PermissionRequested(_)
+                | SessionEventData::CommandExecute(_)
+                | SessionEventData::ElicitationRequested(_)
+        )
+    }
+}
+
 /// Raw session event as received from the CLI.
 ///
 /// The event has common fields (id, timestamp, type) and a data payload
