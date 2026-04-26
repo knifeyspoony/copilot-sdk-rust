@@ -649,6 +649,43 @@ impl Tool {
         self
     }
 
+    /// Add an array parameter with a specified item type to the tool's JSON schema.
+    ///
+    /// JSON Schema requires `items` on array types. This method adds it automatically.
+    pub fn array_parameter(
+        mut self,
+        name: impl Into<String>,
+        items_type: impl Into<String>,
+        description: impl Into<String>,
+        required: bool,
+    ) -> Self {
+        let name = name.into();
+
+        if self.parameters_schema.get("type").is_none() {
+            self.parameters_schema["type"] = serde_json::json!("object");
+        }
+        if self.parameters_schema.get("properties").is_none() {
+            self.parameters_schema["properties"] = serde_json::json!({});
+        }
+
+        self.parameters_schema["properties"][&name] = serde_json::json!({
+            "type": "array",
+            "items": { "type": items_type.into() },
+            "description": description.into(),
+        });
+
+        if required {
+            if self.parameters_schema.get("required").is_none() {
+                self.parameters_schema["required"] = serde_json::json!([]);
+            }
+            if let Some(arr) = self.parameters_schema["required"].as_array_mut() {
+                arr.push(serde_json::json!(name));
+            }
+        }
+
+        self
+    }
+
     /// Derive the parameters JSON schema from a Rust type (requires the `schemars` feature).
     #[cfg(feature = "schemars")]
     pub fn typed_schema<T: schemars::JsonSchema>(mut self) -> Self {
